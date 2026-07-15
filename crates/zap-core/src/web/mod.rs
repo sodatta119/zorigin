@@ -342,6 +342,11 @@ fn bind_listener(addr: SocketAddr) -> Result<TcpListener> {
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
         .context("creating socket")?;
     socket.set_reuse_address(true).context("setting SO_REUSEADDR")?;
+    // Larger socket buffers help throughput on higher-latency Wi-Fi. Best-effort
+    // and set before listen so accepted connections inherit them where the OS
+    // supports it; the OS clamps to its own max, so failures are harmless.
+    let _ = socket.set_send_buffer_size(1 << 20); // 1 MiB
+    let _ = socket.set_recv_buffer_size(1 << 20);
     socket.bind(&addr.into()).context("binding socket")?;
     socket.listen(128).context("listening on socket")?;
     Ok(socket.into())

@@ -106,6 +106,17 @@ switch and (some) pay* — before investing in Horizon 1.
 **Rule:** start a phase only when H0 evidence pulls it. Each stays inside the LAN
 wedge (no cloud) except the explicitly-gated cross-network spike.
 
+### Cheap speed wins (no P2P) · `WEDGE`  ✅ done (2026-07-16)
+- [x] Larger listener socket buffers (`SO_SNDBUF`/`SO_RCVBUF` 1 MiB, best-effort,
+      before listen so accepted conns inherit).
+- [x] Parallel folder uploads: files within a folder upload with bounded
+      concurrency (4 lanes) — hides per-request latency for many-file folders;
+      aggregate progress + pause/resume preserved. Verified: 12-file nested
+      folder byte-exact.
+- [x] Keep-alive: HTTP/1.1 keep-alive already on (tiny_http default); XHR reuses
+      connections. No change needed.
+- Loose multi-file selection already uploads in parallel (uploadOne not awaited).
+
 ### Phase 1.1 — Big-file superpower ⭐ (flagship) · `WEDGE` `$`  ✅ complete (2026-07-15)
 *Why:* resumable, no-limit, verified large-file transfer over flaky Wi-Fi is a
 real un-owned pain; natural Pro line. All LAN.

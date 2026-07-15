@@ -506,6 +506,7 @@ function wirePause(pauseBtn, ctl, ui) {
 // transfer survives a Wi-Fi blip instead of starting over.
 const UPLOAD_CHUNK = 8 * 1024 * 1024; // 8 MB
 const MAX_RESUME_ATTEMPTS = 6;
+const FOLDER_CONCURRENCY = 4; // files uploaded in parallel within a folder
 
 const CRC_TABLE = (() => {
   const t = new Uint32Array(256);
@@ -557,22 +558,33 @@ async function uploadFolderEntries(entries) {
   const ctl = newCtl();
   wirePause(pauseBtn, ctl, ui);
 
-  let base = 0, done = 0, failed = 0;
-  try {
-    for (const { file, relPath } of entries) {
+  // Upload files with bounded concurrency — a big win for folders of many small
+  // files (each transfer is latency-bound, so overlapping them hides round-trips).
+  const perDone = new Array(entries.length).fill(0);
+  const bump = () => updateAgg(ui, perDone.reduce((a, b) => a + b, 0), totalBytes);
+  let done = 0, failed = 0, next = 0;
+  const worker = async () => {
+    for (;;) {
+      const i = next++;               // atomic in single-threaded JS
+      if (i >= entries.length) return;
+      const { file, relPath } = entries[i];
       const relDir = relPath.split("/").slice(0, -1).join("/");
       const destDir = relDir ? joinPath(currentPath, relDir) : currentPath;
       try {
         await runFile(
           file, destDir, file.name, ctl,
-          (fileDone) => updateAgg(ui, base + fileDone, totalBytes),
+          (fileDone) => { perDone[i] = fileDone; bump(); },
           (status) => { ui.tag.textContent = status; ui.tag.classList.remove("done", "err"); },
         );
         done++;
       } catch (e) { failed++; }
-      base += file.size;
-      updateAgg(ui, base, totalBytes);
+      perDone[i] = file.size;         // count the whole file as consumed
+      bump();
     }
+  };
+  try {
+    const lanes = Math.min(FOLDER_CONCURRENCY, entries.length);
+    await Promise.all(Array.from({ length: lanes }, worker));
     ui.bar.style.width = "100%";
     ui.rate.textContent = "";
     ui.tag.textContent = failed ? (done + "/" + entries.length) : ("✓ " + done + (done === 1 ? " file" : " files"));
