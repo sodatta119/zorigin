@@ -204,6 +204,7 @@
   .dlbtn svg { width: 26px; height: 26px; color: var(--accent); flex: none; }
   .dlbtn b { display: block; font-size: 15.5px; font-weight: 650; }
   .dlbtn em { font-style: normal; color: var(--muted); font-size: 12px; font-family: ui-monospace, Menlo, monospace; }
+  .dlbtn.unavail { opacity: .45; pointer-events: none; }
   .cli-note { color: var(--muted); font-size: 14px; margin: 0 auto 4px; }
   .cli-note .mono { color: var(--ink); }
   .android-line { display: inline-flex; flex-wrap: wrap; gap: 14px; align-items: center; justify-content: center;
@@ -403,6 +404,19 @@
       if (t) document.documentElement.setAttribute("data-theme", t);
     } catch (e) {}
   })();
+
+  // Any installer that isn't present yet becomes a disabled "coming soon" button,
+  // so the page adapts to whichever builds have been uploaded.
+  document.querySelectorAll(".dlbtn").forEach(async (a) => {
+    try {
+      const res = await fetch(a.getAttribute("href"), { method: "HEAD" });
+      if (res.ok) return;
+    } catch (e) {}
+    a.classList.add("unavail");
+    a.removeAttribute("href");
+    const em = a.querySelector("em");
+    if (em) em.textContent = "coming soon";
+  });
 </script>
 </body>
 </html>
