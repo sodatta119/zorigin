@@ -150,8 +150,13 @@ fn print_banner(info: &ServerInfo) {
             println!("  (this device: {ip}, port {})", info.port);
             println!();
             println!("Open that URL on the other device (same Wi-Fi):");
-            if let Some(qr) = render_qr(&url) {
+            // The QR carries the pairing key when secured, so scanning it skips
+            // the login prompt.
+            if let Some(qr) = render_qr(&info.url_with_key()) {
                 println!("\n{qr}");
+            }
+            if info.auth_token.is_some() {
+                println!("(Scanning the QR signs in automatically — no password typing.)");
             }
         }
         None => {

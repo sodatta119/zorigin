@@ -57,6 +57,10 @@ pub struct ServerInfo {
     pub port: u16,
     /// Best-guess LAN IP address of this host, if one could be determined.
     pub lan_ip: Option<IpAddr>,
+    /// When the server is secured, the run's pairing key (session token). A URL
+    /// carrying `?k=<key>` auto-authenticates, so scanning the QR skips the
+    /// password. `None` when the server is open (no auth).
+    pub auth_token: Option<String>,
 }
 
 impl ServerInfo {
@@ -68,6 +72,16 @@ impl ServerInfo {
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| "localhost".to_string());
         format!("http://{host}:{}/", self.port)
+    }
+
+    /// The URL to encode in a QR / share link: like [`url`](Self::url) but with
+    /// the pairing key appended when the server is secured, so scanning it grants
+    /// access without typing the password. Identical to `url()` when open.
+    pub fn url_with_key(&self) -> String {
+        match &self.auth_token {
+            Some(token) => format!("{}?k={token}", self.url()),
+            None => self.url(),
+        }
     }
 }
 
@@ -256,9 +270,11 @@ impl Drop for ServerHandle {
 /// `on_ready` is where the caller presents connection details — the core does
 /// no printing of its own, so the same server can back a terminal or a GUI.
 pub fn serve(config: ServeConfig, on_ready: impl FnOnce(&ServerInfo)) -> Result<()> {
-    let (server, dir, info) = bind(&config)?;
+    let (server, dir, mut info) = bind(&config)?;
+    let auth = build_auth(config.auth.as_ref());
+    info.auth_token = auth.as_ref().map(|a| a.token.clone());
     on_ready(&info);
-    let auth = Arc::new(build_auth(config.auth.as_ref()));
+    let auth = Arc::new(auth);
     let stats = Arc::new(Stats::default());
     // Use the calling thread as the acceptor; blocks until the process exits.
     accept_loop(&server, &dir, &auth, &stats);
@@ -270,8 +286,10 @@ pub fn serve(config: ServeConfig, on_ready: impl FnOnce(&ServerInfo)) -> Result<
 /// runs in the background. This is the entry point embedders (e.g. the Android
 /// app via JNI) use, since they can't block the calling thread.
 pub fn spawn(config: ServeConfig) -> Result<(ServerInfo, ServerHandle)> {
-    let (server, dir, info) = bind(&config)?;
-    let auth = Arc::new(build_auth(config.auth.as_ref()));
+    let (server, dir, mut info) = bind(&config)?;
+    let auth = build_auth(config.auth.as_ref());
+    info.auth_token = auth.as_ref().map(|a| a.token.clone());
+    let auth = Arc::new(auth);
     let stats = Arc::new(Stats::default());
     let acceptor = {
         let server = Arc::clone(&server);
@@ -310,6 +328,7 @@ fn bind(config: &ServeConfig) -> Result<(Arc<Server>, Arc<PathBuf>, ServerInfo)>
         dir: (*dir).clone(),
         port: config.port,
         lan_ip: lan_ip(),
+        auth_token: None, // filled in by serve/spawn once auth is built
     };
     Ok((Arc::new(server), dir, info))
 }
@@ -358,6 +377,21 @@ fn handle(request: Request, dir: &Path, auth: Option<&Auth>, stats: &Arc<Stats>)
 
     // Session gate: serve a custom login page (no browser Basic-auth popup).
     if let Some(a) = auth {
+        // Pairing key from the QR / share link: `?k=<token>` auto-authenticates
+        // (set the cookie, then redirect to the clean path so the key doesn't
+        // linger in the address bar / history).
+        if let Some(k) = query_param(query, "k") {
+            if decode_percent(k) == a.token {
+                let cookie = session_cookie(&a.token);
+                return respond(
+                    request,
+                    Response::from_string("")
+                        .with_status_code(303)
+                        .with_header(header("Set-Cookie", &cookie))
+                        .with_header(header("Location", &path)),
+                );
+            }
+        }
         if method == Method::Post && path == "/login" {
             return handle_login(request, a);
         }
@@ -1188,6 +1222,12 @@ struct Auth {
 
 const SESSION_COOKIE: &str = "zap_session";
 
+/// The `Set-Cookie` value that grants a session for `token` (shared by the login
+/// form and the `?k=` pairing-key auto-login).
+fn session_cookie(token: &str) -> String {
+    format!("{SESSION_COOKIE}={token}; Path=/; SameSite=Strict; Max-Age=86400")
+}
+
 /// Build the auth state, generating a fresh session token per run.
 fn build_auth(creds: Option<&Credentials>) -> Option<Auth> {
     creds.map(|c| {
@@ -1213,10 +1253,7 @@ fn handle_login(mut request: Request, auth: &Auth) -> Result<()> {
     let pass = query_param(Some(&body), "pass").map(decode_percent);
 
     if user.as_deref() == Some(auth.user.as_str()) && pass.as_deref() == Some(auth.pass.as_str()) {
-        let cookie = format!(
-            "{SESSION_COOKIE}={}; Path=/; SameSite=Strict; Max-Age=86400",
-            auth.token
-        );
+        let cookie = session_cookie(&auth.token);
         respond(
             request,
             Response::from_string("ok").with_header(header("Set-Cookie", &cookie)),
@@ -1614,6 +1651,56 @@ mod tests {
         let r = String::from_utf8_lossy(&send_raw(port, head, b"abc")).to_lowercase();
         assert!(r.contains("409"), "offset mismatch should be 409: {r}");
         assert!(r.contains("x-zap-offset: 0"), "should report the real offset: {r}");
+
+        handle.stop();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A `?k=<token>` URL must auto-authenticate (303 + session cookie); the
+    /// resulting cookie must unlock the SPA; a wrong key must not.
+    #[test]
+    fn pairing_key_auto_logins() {
+        let _g = port_guard();
+        let dir = std::env::temp_dir().join(format!("zap-pair-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let port = free_port();
+        let (info, handle) = spawn(ServeConfig {
+            dir: dir.clone(),
+            port,
+            bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            auth: Some(Credentials { user: "zap".into(), pass: "zap".into() }),
+        })
+        .expect("bind");
+        let token = info.auth_token.clone().expect("secured server exposes a token");
+
+        let get = |extra: &str| {
+            String::from_utf8_lossy(&send_raw(
+                port,
+                &format!("GET /{extra} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"),
+                b"",
+            ))
+            .to_lowercase()
+        };
+
+        // No key, no cookie → the login page, not the app.
+        assert!(!get("").contains("tap to choose files"), "gated without auth");
+
+        // Correct key → 303 + Set-Cookie with the session token.
+        let keyed = get(&format!("?k={token}"));
+        assert!(keyed.contains("303"), "pairing key should redirect: {keyed}");
+        assert!(keyed.contains(&format!("set-cookie: zap_session={token}")), "sets session cookie: {keyed}");
+
+        // That cookie unlocks the app.
+        let with_cookie = String::from_utf8_lossy(&send_raw(
+            port,
+            &format!("GET / HTTP/1.1\r\nHost: x\r\nCookie: zap_session={token}\r\nConnection: close\r\n\r\n"),
+            b"",
+        ))
+        .to_lowercase();
+        assert!(with_cookie.contains("tap to choose files"), "cookie unlocks the app");
+
+        // Wrong key → still gated.
+        assert!(!get("?k=deadbeef").contains("set-cookie: zap_session"), "wrong key grants nothing");
 
         handle.stop();
         let _ = fs::remove_dir_all(&dir);

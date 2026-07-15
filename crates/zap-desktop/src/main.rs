@@ -150,7 +150,9 @@ impl ZapApp {
         };
         match web::spawn(config) {
             Ok((info, handle)) => {
-                let qr = qr_texture(ctx, &info.url());
+                // The QR carries the pairing key when secured, so scanning it
+                // signs in without typing the password.
+                let qr = qr_texture(ctx, &info.url_with_key());
                 self.running = Some(Running { info, handle, qr, started: Instant::now() });
                 self.speed = 0.0;
                 self.sample = None;

@@ -132,6 +132,25 @@ pub extern "system" fn Java_com_zap_transfer_NativeBridge_nativeRequests(
     running.handle.requests_seen() as jlong
 }
 
+/// Return the share URL (includes the pairing key when secured, so the
+/// recipient is signed in on open), or null for an invalid handle.
+#[no_mangle]
+pub extern "system" fn Java_com_zap_transfer_NativeBridge_nativeShareUrl<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jstring {
+    if handle == 0 {
+        return std::ptr::null_mut();
+    }
+    // Safety: `handle` is a pointer produced by `nativeStart` and not yet freed.
+    let running = unsafe { &*(handle as *const Running) };
+    match env.new_string(running.info.url_with_key()) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 /// Return recent transfers as a JSON array, or "[]" for an invalid handle.
 /// Each item: `{"id","name","dir":"up"|"down","done","total"|null,"finished","ok"}`.
 #[no_mangle]

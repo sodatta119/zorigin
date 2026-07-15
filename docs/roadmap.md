@@ -163,11 +163,16 @@ the friction AirDrop wins on. Mostly web tech, no new infra.
       *Accept:* send a nested folder both ways; structure intact. ✅
 
 ### Phase 1.4 — Frictionless verified pairing · `WEDGE` (switch friction)
-- [ ] **H1-K1** QR carries a one-time token → scanning grants access even in
-      Secure mode (no password typing). **M**
+- [x] **H1-K1** Pairing key in the QR / share link → scanning (or opening a
+      shared keyed link) grants access even in Secure mode, no password typing.
+      *Done (2026-07-15):* `ServerInfo::url_with_key()` appends `?k=<token>`;
+      the server auto-authenticates a matching key (303 + session cookie, then
+      redirects to the clean path). CLI + desktop QR encode the keyed URL;
+      Android share uses it (`nativeShareUrl`). Verified: core unit test + curl +
+      browser (keyed URL → app, key stripped from the address bar).
 - [ ] **H1-K2** Remembered / trusted devices + one-tap reconnect on the same
-      LAN. **M**
-      *Accept:* Secure on; scan QR → straight into the app, no typing.
+      LAN. **M** *(needs native persistence per platform — deferred)*
+      *Accept:* Secure on; scan QR → straight into the app, no typing. ✅ (K1)
 
 ### Phase 1.5 — Encrypted LAN (trust / Pro) · `TRUST` `$`
 *Why:* traffic is plaintext HTTP today — a real objection for sensitive files /

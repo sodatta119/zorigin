@@ -22,6 +22,9 @@ object NativeBridge {
     /** The URL another device on the same Wi-Fi should open, or null. */
     external fun nativeUrl(handle: Long): String?
 
+    /** Share URL — includes the pairing key when secured (recipient auto-signs-in). */
+    external fun nativeShareUrl(handle: Long): String?
+
     /** Recent transfers as a JSON array string (see Rust doc). "[]" if none. */
     external fun nativeTransfers(handle: Long): String?
 

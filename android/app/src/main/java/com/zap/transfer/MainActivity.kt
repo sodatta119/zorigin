@@ -407,12 +407,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun shareLink() {
-        val url = ZapState.url ?: return
-        val text = buildString {
-            append("Open this on the same Wi-Fi to grab my files:\n")
-            append(url)
-            if (secureSwitch.isChecked) append("\n\nLogin — ${credUser()} / ${credPass()}")
+        val base = ZapState.url ?: return
+        // When secured, share the keyed URL so the recipient is signed in on open
+        // (no password to relay). Falls back to the plain URL otherwise.
+        val handle = ZapState.handle
+        val url = if (secureSwitch.isChecked && handle != 0L) {
+            NativeBridge.nativeShareUrl(handle) ?: base
+        } else {
+            base
         }
+        val text = "Open this on the same Wi-Fi to grab my files:\n$url"
         val send = Intent(Intent.ACTION_SEND).apply {
             type = "text/plain"
             putExtra(Intent.EXTRA_TEXT, text)
