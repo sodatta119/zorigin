@@ -195,6 +195,18 @@
   .final h2 { font-size: clamp(28px, 4vw, 44px); font-weight: 760; }
   .final p { color: var(--muted); max-width: 52ch; margin: 16px auto 28px; }
   .final .cta-row { justify-content: center; }
+  .dl { display: flex; flex-wrap: wrap; gap: 14px; justify-content: center; margin: 8px 0 18px; }
+  .dlbtn { display: inline-flex; align-items: center; gap: 13px; text-decoration: none; color: var(--ink);
+    padding: 14px 22px; border-radius: 14px; border: 1px solid var(--line); background: var(--card);
+    min-width: 210px; text-align: left; transition: transform .12s ease, border-color .12s ease; }
+  .dlbtn:hover { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); transform: translateY(-1px); }
+  .dlbtn svg { width: 26px; height: 26px; color: var(--accent); flex: none; }
+  .dlbtn b { display: block; font-size: 15.5px; font-weight: 650; }
+  .dlbtn em { font-style: normal; color: var(--muted); font-size: 12px; font-family: ui-monospace, Menlo, monospace; }
+  .cli-note { color: var(--muted); font-size: 14px; margin: 0 auto 4px; }
+  .cli-note .mono { color: var(--ink); }
+  .android-line { display: inline-flex; flex-wrap: wrap; gap: 14px; align-items: center; justify-content: center;
+    margin-top: 30px; padding-top: 26px; border-top: 1px solid var(--line); color: var(--muted); font-size: 14.5px; }
 
   /* ---- Footer ---- */
   footer { border-top: 1px solid var(--line); padding: 34px 0; color: var(--muted); font-size: 13.5px; }
@@ -344,20 +356,31 @@
 
   <section class="wrap final" id="get">
     <div class="band">
-      <p class="eyebrow" style="justify-content:center">Coming soon</p>
-      <h2>Be first to try Zap.</h2>
-      <p>The Android app lands on the Play Store; the desktop app and CLI are free for Mac,
-        Windows and Linux. Leave your email and we’ll tell you the moment it’s live.</p>
-      <div class="cta-row">
-        <!-- TODO: point this at your waitlist / signup form -->
-        <a class="btn btn-primary" href="#">Join the waitlist</a>
+      <p class="eyebrow" style="justify-content:center">Download</p>
+      <h2>Free for Mac, Windows &amp; Linux.</h2>
+      <p>Grab the desktop app — it hosts the transfer and shows the link + QR. The Android
+        app (host straight from your phone) is coming to the Play Store.</p>
+      <!-- Download links point at files you place next to this page under /download.
+           Build them locally (scripts/build-dist.sh → dist/) or from a tagged CI release. -->
+      <div class="dl">
+        <a class="dlbtn" href="download/zap-macos.dmg" download>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="4" width="18" height="12" rx="1.5"/><path d="M2 20h20"/></svg>
+          <span><b>macOS</b><em>Universal · .dmg</em></span>
+        </a>
+        <a class="dlbtn" href="download/zap-windows.zip" download>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="4" width="18" height="14" rx="1.5"/></svg>
+          <span><b>Windows</b><em>.zip</em></span>
+        </a>
+        <a class="dlbtn" href="download/zap-linux.deb" download>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M9 3c-1 3 0 5 0 7-1 2-4 5-4 8 0 2 2 3 7 3s7-1 7-3c0-3-3-6-4-8 0-2 1-4 0-7-1-2-5-2-6 0z"/></svg>
+          <span><b>Linux</b><em>.deb</em></span>
+        </a>
       </div>
-      <div class="plats" style="justify-content:center;margin-top:34px">
-        <span class="plat"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 18V9h12v9a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2zM8.5 6l-1-1.7M15.5 6l1-1.7M7 9a5 5 0 0 1 10 0z"/></svg>Android <em>app</em></span>
-        <span class="plat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="4" width="18" height="12" rx="1.5"/><path d="M2 20h20"/></svg>macOS <em>universal</em></span>
-        <span class="plat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="4" width="18" height="14" rx="1.5"/></svg>Windows</span>
-        <span class="plat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M9 3c-1 3 0 5 0 7-1 2-4 5-4 8 0 2 2 3 7 3s7-1 7-3c0-3-3-6-4-8 0-2 1-4 0-7-1-2-5-2-6 0z"/></svg>Linux</span>
-        <span class="plat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 5h16v14H4z"/><path d="M7 9l3 3-3 3M12 15h5"/></svg>CLI</span>
+      <p class="cli-note">Prefer the terminal? The CLI (<span class="mono">zap serve</span>) ships inside each download.</p>
+      <div class="android-line">
+        <span>📱 Android app — coming to the Play Store</span>
+        <!-- TODO: point this at your waitlist / signup form -->
+        <a class="btn btn-ghost" style="padding:9px 18px" href="#">Notify me</a>
       </div>
     </div>
   </section>

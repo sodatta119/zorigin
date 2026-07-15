@@ -7,3 +7,10 @@ android/.idea/
 
 # local-only handoff notes
 docs/HANDOFF.md
+
+# Landing-page installer binaries (copied in at deploy time)
+site/download/*.dmg
+site/download/*.zip
+site/download/*.deb
+site/download/*.exe
+site/download/*.tar.gz
