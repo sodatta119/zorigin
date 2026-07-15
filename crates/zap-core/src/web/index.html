@@ -127,6 +127,8 @@
   .linkbtn { font: inherit; font-size: 12.5px; color: var(--accent); background: none; border: none; padding: 0; cursor: pointer; text-decoration: underline; }
   #uploads .sub { flex: none; font-size: 11px; color: var(--muted-fg); min-width: 0; }
   #uploads .name .folder { color: var(--accent); }
+  #uploads .incoming .hint { display: block; font-size: 11px; color: var(--muted-fg); margin-top: 2px; }
+  #uploads .incoming .tag { color: var(--accent); }
 
   /* Breadcrumb */
   .crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 1px; font-size: 13px; min-width: 0; }
@@ -529,7 +531,9 @@ const PLAY_ICON = `<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>`;
 
 // Single file → its own row.
 async function uploadOne(file) {
-  const { ui, pauseBtn } = makeRow(file.name);
+  const { li, ui, pauseBtn } = makeRow(file.name);
+  li.dataset.name = file.name;
+  removeIncoming(file.name); // supersede any "resume" placeholder for this file
   const ctl = newCtl();
   wirePause(pauseBtn, ctl, ui);
   try {
@@ -737,6 +741,34 @@ function fmtEta(sec) {
   return Math.floor(sec / 3600) + "h" + Math.round((sec % 3600) / 60) + "m";
 }
 
+// On load, show any uploads the host still holds a partial for (e.g. this page
+// was refreshed mid-transfer). The bytes are safe on the host — re-selecting the
+// same file resumes it from where it left off.
+async function loadIncoming() {
+  let data;
+  try {
+    const res = await fetch("/api/incoming");
+    if (!res.ok) return;
+    data = await res.json();
+  } catch (e) { return; }
+  for (const e of (data.entries || [])) {
+    if ([...uploads.children].some((li) => li.dataset.name === e.name)) continue;
+    const li = document.createElement("li");
+    li.className = "incoming";
+    li.dataset.name = e.name;
+    li.innerHTML = `<span class="name"><b class="nm"></b><span class="hint">unfinished · re-select this file to resume</span></span><span class="rate"></span><span class="tag">interrupted</span>`;
+    li.querySelector(".nm").textContent = e.name;
+    li.querySelector(".rate").textContent = fmtSize(e.done) + " received";
+    uploads.appendChild(li);
+  }
+}
+
+function removeIncoming(name) {
+  uploads.querySelectorAll("li.incoming").forEach((li) => {
+    if (li.dataset.name === name) li.remove();
+  });
+}
+
 const refresh = $("#refresh");
 refresh.onclick = () => {
   refresh.classList.add("spin");
@@ -757,6 +789,7 @@ search.addEventListener("search", () => {
 });
 
 loadDir("");
+loadIncoming();
 </script>
 </body>
 </html>

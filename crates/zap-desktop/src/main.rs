@@ -119,6 +119,14 @@ struct Running {
     started: Instant,
 }
 
+/// Persistent transfer-history file (survives server stop/start + app restart).
+/// Lives in the OS app-data dir, not the shared folder.
+fn history_path() -> Option<PathBuf> {
+    let dir = dirs::data_local_dir()?.join("zap");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("transfers.tsv"))
+}
+
 /// How long to wait for a first client before warning that nothing can connect.
 const NO_CLIENT_WARN_SECS: u64 = 20;
 
@@ -183,6 +191,7 @@ impl ZapApp {
             port: self.port,
             bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             auth,
+            history: history_path(),
         };
         match web::spawn(config) {
             Ok((info, handle)) => {

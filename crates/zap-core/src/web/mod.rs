@@ -44,6 +44,10 @@ pub struct ServeConfig {
     pub bind: IpAddr,
     /// If set, every request must authenticate with these credentials.
     pub auth: Option<Credentials>,
+    /// If set, completed transfer records are persisted to this file and reloaded
+    /// on start, so the activity history survives a server stop/start or an app
+    /// restart. `None` disables persistence (e.g. the one-shot CLI).
+    pub history: Option<PathBuf>,
 }
 
 /// Details about a running server, handed to the caller once it is bound and
@@ -148,12 +152,81 @@ pub struct Stats {
     /// isolation, firewall). See [`ServerHandle::requests_seen`].
     requests: AtomicU64,
     transfers: Mutex<Vec<Arc<TransferState>>>,
+    /// Where completed transfers are persisted (so history survives a restart).
+    history_path: Option<PathBuf>,
 }
 
 impl Stats {
+    /// Create stats, loading any previously-persisted transfer history so the
+    /// activity list survives a server stop/start or app restart.
+    fn new(history_path: Option<PathBuf>) -> Self {
+        let stats = Stats { history_path, ..Default::default() };
+        stats.load_history();
+        stats
+    }
+
     /// Register a new transfer and return its live state to update as bytes flow.
     fn begin(&self, name: &str, direction: Direction, total: Option<u64>) -> Arc<TransferState> {
         self.create(String::new(), name, direction, total)
+    }
+
+    /// Persist the finished transfers (most recent, capped) as simple TSV so the
+    /// history survives a restart. Atomic write via a temp file + rename.
+    fn save_history(&self) {
+        let Some(path) = &self.history_path else { return };
+        let Ok(list) = self.transfers.lock() else { return };
+        let mut out = String::new();
+        for t in list.iter().filter(|t| t.finished.load(Ordering::Relaxed)) {
+            let dir = match t.direction {
+                Direction::Upload => "up",
+                Direction::Download => "down",
+            };
+            let name = t.name.replace(['\t', '\n', '\r'], " ");
+            let total = t.total.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string());
+            out.push_str(&format!(
+                "{dir}\t{name}\t{total}\t{}\t{}\t{}\n",
+                t.done.load(Ordering::Relaxed),
+                t.ok.load(Ordering::Relaxed) as u8,
+                t.verified.load(Ordering::Relaxed) as u8,
+            ));
+        }
+        let tmp = path.with_extension("tmp");
+        if fs::write(&tmp, out).is_ok() {
+            let _ = fs::rename(&tmp, path);
+        }
+    }
+
+    /// Load persisted transfer records as finished history entries.
+    fn load_history(&self) {
+        let Some(path) = &self.history_path else { return };
+        let Ok(data) = fs::read_to_string(path) else { return };
+        let Ok(mut list) = self.transfers.lock() else { return };
+        for line in data.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() != 6 {
+                continue;
+            }
+            let direction = if f[0] == "down" { Direction::Download } else { Direction::Upload };
+            let total = f[2].parse::<u64>().ok();
+            let done = f[3].parse::<u64>().unwrap_or(0);
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            list.push(Arc::new(TransferState {
+                id,
+                key: String::new(),
+                name: f[1].to_string(),
+                direction,
+                total,
+                done: AtomicU64::new(done),
+                finished: AtomicBool::new(true),
+                ok: AtomicBool::new(f[4] == "1"),
+                verified: AtomicBool::new(f[5] == "1"),
+                started: Instant::now(),
+            }));
+        }
+        let len = list.len();
+        if len > 50 {
+            list.drain(0..len - 50);
+        }
     }
 
     /// Begin (or resume) a keyed resumable upload. If an unfinished transfer for
@@ -275,7 +348,7 @@ pub fn serve(config: ServeConfig, on_ready: impl FnOnce(&ServerInfo)) -> Result<
     info.auth_token = auth.as_ref().map(|a| a.token.clone());
     on_ready(&info);
     let auth = Arc::new(auth);
-    let stats = Arc::new(Stats::default());
+    let stats = Arc::new(Stats::new(config.history.clone()));
     // Use the calling thread as the acceptor; blocks until the process exits.
     accept_loop(&server, &dir, &auth, &stats);
     Ok(())
@@ -290,7 +363,7 @@ pub fn spawn(config: ServeConfig) -> Result<(ServerInfo, ServerHandle)> {
     let auth = build_auth(config.auth.as_ref());
     info.auth_token = auth.as_ref().map(|a| a.token.clone());
     let auth = Arc::new(auth);
-    let stats = Arc::new(Stats::default());
+    let stats = Arc::new(Stats::new(config.history.clone()));
     let acceptor = {
         let server = Arc::clone(&server);
         let dir = Arc::clone(&dir);
@@ -423,6 +496,9 @@ fn handle(request: Request, dir: &Path, auth: Option<&Auth>, stats: &Arc<Stats>)
             let q = query_param(query, "q").map(decode_percent).unwrap_or_default();
             respond(request, json_response(&search_json(dir, &q)))
         }
+        // In-progress uploads (temp files) so a refreshed sender can see what's
+        // resumable and continue by re-selecting the file.
+        (Method::Get, "/api/incoming") => respond(request, json_response(&incoming_json(dir))),
         (Method::Get, "/download") => {
             let rel = query_param(query, "path").map(decode_percent).unwrap_or_default();
             serve_download(request, dir, &rel, stats)
@@ -501,6 +577,7 @@ fn serve_download(request: Request, root: &Path, rel: &str, stats: &Stats) -> Re
     let result = respond(request, response);
     transfer.finished.store(true, Ordering::Relaxed);
     transfer.ok.store(true, Ordering::Relaxed);
+    stats.save_history();
     result
 }
 
@@ -894,6 +971,7 @@ fn resumable_upload(
                     transfer.verified.store(true, Ordering::Relaxed);
                 }
                 println!("received {name} ({total} bytes, verified) into {}", folder.display());
+                stats.save_history();
                 return respond(
                     request,
                     Response::from_string("ok").with_header(header("X-Zap-Verified", "true")),
@@ -902,6 +980,7 @@ fn resumable_upload(
                 // Corrupt — discard the temp file so a retry starts clean.
                 let _ = fs::remove_file(&part);
                 eprintln!("zap: integrity check failed for {name} (crc mismatch)");
+                stats.save_history();
                 return respond(
                     request,
                     Response::from_string("integrity check failed")
@@ -923,6 +1002,7 @@ fn resumable_upload(
         Err(e) => {
             transfer.finished.store(true, Ordering::Relaxed);
             eprintln!("zap: upload of {name} interrupted at {newsize} bytes: {e:#}");
+            stats.save_history();
             respond(
                 request,
                 Response::from_string("interrupted")
@@ -948,10 +1028,12 @@ fn legacy_upload(mut request: Request, folder: &Path, name: &str, stats: &Stats)
         Ok(bytes) => {
             transfer.ok.store(true, Ordering::Relaxed);
             println!("received {name} ({bytes} bytes) into {}", folder.display());
+            stats.save_history();
             respond(request, Response::from_string("ok"))
         }
         Err(e) => {
             eprintln!("zap: upload of {name} failed: {e:#}");
+            stats.save_history();
             respond(request, Response::from_string("upload failed").with_status_code(500))
         }
     }
@@ -1177,6 +1259,38 @@ fn search_walk(root: &Path, dir: &Path, needle: &str, hits: &mut Vec<String>, bu
         }
         if meta.is_dir() {
             search_walk(root, &path, needle, hits, budget);
+        }
+    }
+}
+
+/// List in-progress upload temp files (`.zap-part-*`) so a client that reloaded
+/// mid-upload can see what's unfinished. `{entries:[{path,name,done}]}` where
+/// `name` is the real filename and `done` is the bytes already received.
+fn incoming_json(root: &Path) -> String {
+    let mut hits: Vec<String> = Vec::new();
+    incoming_walk(root, root, &mut hits);
+    format!("{{\"entries\":[{}]}}", hits.join(","))
+}
+
+fn incoming_walk(root: &Path, dir: &Path, hits: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if meta.is_dir() {
+            incoming_walk(root, &entry.path(), hits);
+        } else if let Some(real) = name.strip_prefix(PART_PREFIX) {
+            let rel = dir
+                .strip_prefix(root)
+                .ok()
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            hits.push(format!(
+                "{{\"path\":{},\"name\":{},\"done\":{}}}",
+                json_string(&rel),
+                json_string(real),
+                meta.len()
+            ));
         }
     }
 }
@@ -1428,6 +1542,7 @@ mod tests {
             port,
             bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
             auth: None,
+            history: None,
         };
 
         let (_info, handle) = spawn(make_config()).expect("first bind should succeed");
@@ -1456,6 +1571,7 @@ mod tests {
             port,
             bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
             auth: None,
+            history: None,
         })
         .expect("bind");
 
@@ -1497,6 +1613,7 @@ mod tests {
             port,
             bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
             auth: None,
+            history: None,
         })
         .expect("bind");
         (port, handle)
@@ -1641,6 +1758,46 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A completed transfer must be persisted and reappear after a stop/start.
+    #[test]
+    fn transfer_history_survives_restart() {
+        let _g = port_guard();
+        let dir = std::env::temp_dir().join(format!("zap-hist-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let hist = dir.join("history.tsv");
+        let port = free_port();
+        let cfg = || ServeConfig {
+            dir: dir.clone(),
+            port,
+            bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            auth: None,
+            history: Some(hist.clone()),
+        };
+
+        let (_i, h) = spawn(cfg()).expect("bind");
+        let full = b"hello";
+        let crc_src = dir.join("crc-src");
+        fs::write(&crc_src, full).unwrap();
+        let crc = crc32_file(&crc_src).unwrap();
+        let head = format!(
+            "PUT /upload?path=&name=h.bin&offset=0 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\
+             X-Zap-Total: 5\r\nX-Zap-Crc32: {crc:08x}\r\nContent-Length: 5\r\n\r\n"
+        );
+        send_raw(port, &head, full);
+        h.stop();
+
+        // Restart with the same history file — the record must be reloaded.
+        let (_i2, h2) = spawn(cfg()).expect("rebind");
+        let list = h2.transfers();
+        assert!(
+            list.iter().any(|t| t.name == "h.bin" && t.finished && t.ok && t.verified),
+            "completed transfer should survive a restart: {list:?}"
+        );
+        h2.stop();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// A wrong offset must be rejected with 409 + the real offset, not corrupt
     /// the file.
     #[test]
@@ -1674,6 +1831,7 @@ mod tests {
             port,
             bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
             auth: Some(Credentials { user: "zap".into(), pass: "zap".into() }),
+            history: None,
         })
         .expect("bind");
         let token = info.auth_token.clone().expect("secured server exposes a token");

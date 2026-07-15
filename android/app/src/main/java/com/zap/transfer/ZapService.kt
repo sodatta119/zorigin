@@ -40,7 +40,10 @@ class ZapService : Service() {
         // Reading it requires "All files access" (MANAGE_EXTERNAL_STORAGE),
         // which the activity ensures before starting the service.
         // `user`/`pass` are null unless the user enabled "Secure".
-        handle = NativeBridge.nativeStart(dir, PORT, user, pass)
+        // Transfer history persists in the app's private files dir, so the
+        // Transfers tab survives a server stop/start or app restart.
+        val history = java.io.File(filesDir, "transfers.tsv").absolutePath
+        handle = NativeBridge.nativeStart(dir, PORT, user, pass, history)
         val url = if (handle != 0L) NativeBridge.nativeUrl(handle) else null
 
         createChannel()

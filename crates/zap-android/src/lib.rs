@@ -67,6 +67,7 @@ pub extern "system" fn Java_com_zap_transfer_NativeBridge_nativeStart<'local>(
     port: jint,
     user: JString<'local>,
     pass: JString<'local>,
+    history: JString<'local>,
 ) -> jlong {
     let dir: String = match env.get_string(&dir) {
         Ok(s) => s.into(),
@@ -83,6 +84,7 @@ pub extern "system" fn Java_com_zap_transfer_NativeBridge_nativeStart<'local>(
         port: port as u16,
         bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED), // 0.0.0.0 — reachable on the LAN
         auth,
+        history: read_opt(&mut env, history).map(PathBuf::from),
     };
 
     match web::spawn(config) {

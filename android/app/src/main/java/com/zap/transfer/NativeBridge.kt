@@ -17,7 +17,7 @@ object NativeBridge {
      * Pass [user] and [pass] to require a login (HTTP Basic auth), or null for
      * none. Returns an opaque handle, or 0 if the server could not be started.
      */
-    external fun nativeStart(dir: String, port: Int, user: String?, pass: String?): Long
+    external fun nativeStart(dir: String, port: Int, user: String?, pass: String?, history: String?): Long
 
     /** The URL another device on the same Wi-Fi should open, or null. */
     external fun nativeUrl(handle: Long): String?

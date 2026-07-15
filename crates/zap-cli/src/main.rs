@@ -45,6 +45,7 @@ fn run() -> Result<()> {
                     port,
                     bind,
                     auth,
+                    history: None, // one-shot CLI: no persistent history
                 },
                 |info| {
                     print_banner(info);
