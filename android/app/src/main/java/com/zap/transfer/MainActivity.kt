@@ -58,7 +58,7 @@ class MainActivity : AppCompatActivity() {
     private var polling = false
     private data class Sample(var t: Long, var done: Long, var speed: Double)
     private val speeds = HashMap<Long, Sample>()
-    private data class Xfer(val id: Long, val name: String, val dir: String, val done: Long, val total: Long?, val finished: Boolean, val ok: Boolean, val verified: Boolean)
+    private data class Xfer(val id: Long, val name: String, val path: String, val dir: String, val done: Long, val total: Long?, val finished: Boolean, val ok: Boolean, val verified: Boolean)
 
     private val pollRunnable = object : Runnable {
         override fun run() {
@@ -317,6 +317,14 @@ class MainActivity : AppCompatActivity() {
             } else {
                 pb.visibility = View.GONE
             }
+            // "Open" reveals/opens a completed file that still exists on disk.
+            val openBtn = row.findViewById<Button>(R.id.openBtn)
+            if (t.finished && t.ok && t.path.isNotEmpty() && java.io.File(t.path).exists()) {
+                openBtn.visibility = View.VISIBLE
+                openBtn.setOnClickListener { openFile(t.path) }
+            } else {
+                openBtn.visibility = View.GONE
+            }
             transfersView.addView(row)
         }
         speeds.keys.retainAll(list.map { it.id }.toSet())
@@ -333,6 +341,7 @@ class MainActivity : AppCompatActivity() {
                     Xfer(
                         id = o.getLong("id"),
                         name = o.getString("name"),
+                        path = o.optString("path", ""),
                         dir = o.getString("dir"),
                         done = o.getLong("done"),
                         total = if (o.isNull("total")) null else o.getLong("total"),
@@ -422,6 +431,22 @@ class MainActivity : AppCompatActivity() {
             putExtra(Intent.EXTRA_TEXT, text)
         }
         startActivity(Intent.createChooser(send, "Share zap link"))
+    }
+
+    /// Open a received/sent file with the system chooser (via a FileProvider URI).
+    private fun openFile(path: String) {
+        try {
+            val uri = androidx.core.content.FileProvider.getUriForFile(
+                this, "$packageName.fileprovider", java.io.File(path)
+            )
+            val mime = contentResolver.getType(uri) ?: "*/*"
+            val view = Intent(Intent.ACTION_VIEW)
+                .setDataAndType(uri, mime)
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            startActivity(Intent.createChooser(view, "Open with"))
+        } catch (e: Exception) {
+            Toast.makeText(this, "Can't open this file", Toast.LENGTH_SHORT).show()
+        }
     }
 
     // ---- Credentials / folder helpers ----

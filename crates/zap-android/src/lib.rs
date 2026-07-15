@@ -186,9 +186,10 @@ fn transfers_json(items: &[zap_core::web::TransferInfo]) -> String {
         };
         let total = t.total.map(|n| n.to_string()).unwrap_or_else(|| "null".to_string());
         s.push_str(&format!(
-            "{{\"id\":{},\"name\":{},\"dir\":\"{}\",\"done\":{},\"total\":{},\"finished\":{},\"ok\":{},\"verified\":{}}}",
+            "{{\"id\":{},\"name\":{},\"path\":{},\"dir\":\"{}\",\"done\":{},\"total\":{},\"finished\":{},\"ok\":{},\"verified\":{}}}",
             t.id,
             json_string(&t.name),
+            json_string(&t.path),
             dir,
             t.done,
             total,

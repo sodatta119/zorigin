@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- The shared folder lives under external storage; cover the whole volume
+         so any received/sent file can be opened via a content:// URI. -->
+    <external-path name="external" path="." />
+    <root-path name="root" path="/" />
+</paths>

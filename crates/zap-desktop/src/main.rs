@@ -258,11 +258,11 @@ impl ZapApp {
         if rows.is_empty() && std::env::var("ZAP_SHOT_DEMO").is_ok() {
             return vec![
                 (
-                    TransferInfo { id: 2, name: "IMG_2231.mov".into(), direction: Direction::Upload, done: 734_003_200, total: Some(1_610_612_736), finished: false, ok: false, verified: false, elapsed_secs: 12.0 },
+                    TransferInfo { id: 2, name: "IMG_2231.mov".into(), path: String::new(), direction: Direction::Upload, done: 734_003_200, total: Some(1_610_612_736), finished: false, ok: false, verified: false, elapsed_secs: 12.0 },
                     28_311_552.0,
                 ),
                 (
-                    TransferInfo { id: 1, name: "Q3-report.pdf".into(), direction: Direction::Download, done: 2_411_724, total: Some(2_411_724), finished: true, ok: true, verified: true, elapsed_secs: 1.0 },
+                    TransferInfo { id: 1, name: "Q3-report.pdf".into(), path: String::new(), direction: Direction::Download, done: 2_411_724, total: Some(2_411_724), finished: true, ok: true, verified: true, elapsed_secs: 1.0 },
                     0.0,
                 ),
             ];
@@ -587,8 +587,34 @@ fn transfers_view(ui: &mut egui::Ui, running: bool, rows: &[(TransferInfo, f64)]
                     ui.add(egui::ProgressBar::new(frac).fill(ACCENT));
                 }
             }
+            // Reveal the received/sent file in the OS file manager.
+            if t.finished && t.ok && !t.path.is_empty() && std::path::Path::new(&t.path).exists() {
+                ui.add_space(6.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Open location").clicked() {
+                        reveal_in_file_manager(&t.path);
+                    }
+                });
+            }
         });
         ui.add_space(8.0);
+    }
+}
+
+/// Reveal a file in the OS file manager (Finder / Explorer / default browser).
+fn reveal_in_file_manager(path: &str) {
+    use std::process::Command;
+    #[cfg(target_os = "macos")]
+    let _ = Command::new("open").arg("-R").arg(path).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = Command::new("explorer").arg(format!("/select,{path}")).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let dir = std::path::Path::new(path)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let _ = Command::new("xdg-open").arg(dir).spawn();
     }
 }
 

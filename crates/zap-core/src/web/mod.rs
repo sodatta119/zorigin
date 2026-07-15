@@ -116,6 +116,9 @@ struct TransferState {
     /// single row, not one-per-chunk. Empty for downloads / one-shot uploads.
     key: String,
     name: String,
+    /// Absolute path of the file on this host (for "open file location"). Empty
+    /// if unknown.
+    path: String,
     direction: Direction,
     total: Option<u64>,
     done: AtomicU64,
@@ -131,6 +134,8 @@ struct TransferState {
 pub struct TransferInfo {
     pub id: u64,
     pub name: String,
+    /// Absolute path of the file on this host; empty if unknown.
+    pub path: String,
     pub direction: Direction,
     pub done: u64,
     pub total: Option<u64>,
@@ -166,8 +171,8 @@ impl Stats {
     }
 
     /// Register a new transfer and return its live state to update as bytes flow.
-    fn begin(&self, name: &str, direction: Direction, total: Option<u64>) -> Arc<TransferState> {
-        self.create(String::new(), name, direction, total)
+    fn begin(&self, name: &str, direction: Direction, total: Option<u64>, path: &str) -> Arc<TransferState> {
+        self.create(String::new(), name, direction, total, path)
     }
 
     /// Persist the finished transfers (most recent, capped) as simple TSV so the
@@ -182,9 +187,11 @@ impl Stats {
                 Direction::Download => "down",
             };
             let name = t.name.replace(['\t', '\n', '\r'], " ");
+            let path = t.path.replace(['\t', '\n', '\r'], " ");
             let total = t.total.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string());
+            // path is last so it can hold anything except tab/newline (sanitized).
             out.push_str(&format!(
-                "{dir}\t{name}\t{total}\t{}\t{}\t{}\n",
+                "{dir}\t{name}\t{total}\t{}\t{}\t{}\t{path}\n",
                 t.done.load(Ordering::Relaxed),
                 t.ok.load(Ordering::Relaxed) as u8,
                 t.verified.load(Ordering::Relaxed) as u8,
@@ -202,18 +209,20 @@ impl Stats {
         let Ok(data) = fs::read_to_string(path) else { return };
         let Ok(mut list) = self.transfers.lock() else { return };
         for line in data.lines() {
-            let f: Vec<&str> = line.split('\t').collect();
-            if f.len() != 6 {
+            let f: Vec<&str> = line.splitn(7, '\t').collect();
+            if f.len() < 6 {
                 continue;
             }
             let direction = if f[0] == "down" { Direction::Download } else { Direction::Upload };
             let total = f[2].parse::<u64>().ok();
             let done = f[3].parse::<u64>().unwrap_or(0);
+            let path = f.get(6).map(|s| s.to_string()).unwrap_or_default();
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
             list.push(Arc::new(TransferState {
                 id,
                 key: String::new(),
                 name: f[1].to_string(),
+                path,
                 direction,
                 total,
                 done: AtomicU64::new(done),
@@ -233,7 +242,7 @@ impl Stats {
     /// the same `key` (destination) already exists — an earlier chunk or a prior
     /// attempt of the same file — reuse it so every chunk and every pause/resume
     /// shows as one continuous row instead of spawning a new one each time.
-    fn begin_upload(&self, key: &str, name: &str, total: Option<u64>) -> Arc<TransferState> {
+    fn begin_upload(&self, key: &str, name: &str, total: Option<u64>, path: &str) -> Arc<TransferState> {
         if let Ok(list) = self.transfers.lock() {
             if let Some(existing) = list
                 .iter()
@@ -243,7 +252,7 @@ impl Stats {
                 return Arc::clone(existing);
             }
         }
-        self.create(key.to_string(), name, Direction::Upload, total)
+        self.create(key.to_string(), name, Direction::Upload, total, path)
     }
 
     fn create(
@@ -252,12 +261,14 @@ impl Stats {
         name: &str,
         direction: Direction,
         total: Option<u64>,
+        path: &str,
     ) -> Arc<TransferState> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let state = Arc::new(TransferState {
             id,
             key,
             name: name.to_string(),
+            path: path.to_string(),
             direction,
             total,
             done: AtomicU64::new(0),
@@ -302,6 +313,7 @@ impl ServerHandle {
             .map(|t| TransferInfo {
                 id: t.id,
                 name: t.name.clone(),
+                path: t.path.clone(),
                 direction: t.direction,
                 done: t.done.load(Ordering::Relaxed),
                 total: t.total,
@@ -552,7 +564,12 @@ fn serve_download(request: Request, root: &Path, rel: &str, stats: &Stats) -> Re
     // `Accept-Ranges: bytes`.
     let range = header_value(&request, "Range").and_then(|h| parse_range(h, total));
 
-    let transfer = stats.begin(&filename, Direction::Download, Some(range.map_or(total, |(s, e)| e - s + 1)));
+    let transfer = stats.begin(
+        &filename,
+        Direction::Download,
+        Some(range.map_or(total, |(s, e)| e - s + 1)),
+        &path.to_string_lossy(),
+    );
 
     let (status, body_len, content_range) = match range {
         Some((start, end)) => {
@@ -627,7 +644,7 @@ fn serve_folder_zip(request: Request, root: &Path, rel: &str, stats: &Arc<Stats>
     let total: u64 = files.iter().map(|(_, _, s)| *s).sum();
 
     let zip_name = format!("{}.zip", base.replace('"', ""));
-    let transfer = stats.begin(&zip_name, Direction::Download, Some(total));
+    let transfer = stats.begin(&zip_name, Direction::Download, Some(total), &folder.to_string_lossy());
 
     // Producer thread generates the ZIP and pushes chunks; the response reader
     // pulls them. A small bounded channel gives natural backpressure.
@@ -943,7 +960,8 @@ fn resumable_upload(
     // Key by the destination temp path so all chunks + resumes of this file
     // coalesce into one transfer row instead of one row per chunk.
     let key = part.to_string_lossy().into_owned();
-    let transfer = stats.begin_upload(&key, name, total);
+    let dest_path = folder.join(name).to_string_lossy().into_owned();
+    let transfer = stats.begin_upload(&key, name, total, &dest_path);
     // Reflect bytes already on disk so the progress bar resumes, not restarts.
     transfer.done.store(cur, Ordering::Relaxed);
 
@@ -1018,7 +1036,7 @@ fn resumable_upload(
 fn legacy_upload(mut request: Request, folder: &Path, name: &str, stats: &Stats) -> Result<()> {
     let dest = folder.join(name);
     let total = request.body_length().map(|n| n as u64);
-    let transfer = stats.begin(name, Direction::Upload, total);
+    let transfer = stats.begin(name, Direction::Upload, total, &dest.to_string_lossy());
 
     // On failure we must still send a response, otherwise the client hangs and
     // reports a confusing generic error instead of a clean failure.
