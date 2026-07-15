@@ -1,4 +1,4 @@
-# zap
+# Zap⚡ 
 
 Fast file transfer between Android devices and macOS - a Rust CLI.
 
