@@ -47,7 +47,8 @@
   }
 
   * { box-sizing: border-box; }
-  html { -webkit-text-size-adjust: 100%; }
+  html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
   body {
     margin: 0;
     background: var(--ground);
@@ -243,8 +244,7 @@
       The other device just opens a link — <b>no app to install</b>. No cloud, no accounts,
       and none of the flaky auto-discovery that makes the free tools quietly fail.</p>
     <div class="cta-row">
-      <!-- TODO: point this at your waitlist / signup form (Tally, Google Forms, Formspree, …) -->
-      <a class="btn btn-primary" href="#get">Get notified at launch</a>
+      <a class="btn btn-primary" href="#get">Download for free</a>
       <a class="btn btn-ghost" href="#how">See how it works</a>
     </div>
 
@@ -379,8 +379,6 @@
       <p class="cli-note">Prefer the terminal? The CLI (<span class="mono">zap serve</span>) ships inside each download.</p>
       <div class="android-line">
         <span>📱 Android app — coming to the Play Store</span>
-        <!-- TODO: point this at your waitlist / signup form -->
-        <a class="btn btn-ghost" style="padding:9px 18px" href="#">Notify me</a>
       </div>
     </div>
   </section>
