@@ -22,7 +22,13 @@ const ACCENT: Color32 = Color32::from_rgb(0xD9, 0x8A, 0x1E); // amber — reads 
 const ACCENT_BTN: Color32 = Color32::from_rgb(0xE0, 0x93, 0x22); // primary button fill
 const WARN: Color32 = Color32::from_rgb(0xC7, 0x3B, 0x2E);
 const OK: Color32 = Color32::from_rgb(0x2E, 0x9E, 0x57); // green — "reachable" confirmation
-const BG: Color32 = Color32::from_rgb(0xF7, 0xF6, 0xF3); // window / panel background
+const BG_LIGHT: Color32 = Color32::from_rgb(0xF7, 0xF6, 0xF3); // light window / panel background
+const BG_DARK: Color32 = Color32::from_rgb(0x0D, 0x0D, 0x0F); // dark bg (matches the web/Android UI)
+
+/// Window/panel background for the active theme.
+fn theme_bg(dark: bool) -> Color32 {
+    if dark { BG_DARK } else { BG_LIGHT }
+}
 
 fn main() -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
@@ -36,20 +42,30 @@ fn main() -> eframe::Result<()> {
     eframe::run_native("Zap", options, Box::new(|_cc| Ok(Box::<ZapApp>::default())))
 }
 
-/// Layer our accent + spacing + rounding on top of egui's current (system
-/// light/dark) theme, every frame — so the app matches the OS and stays readable.
-fn tune_theme(ctx: &egui::Context) {
+/// Layer our accent + spacing + rounding on top of a deterministic light or dark
+/// base (not the washed-out system default), re-applied every frame.
+fn tune_theme(ctx: &egui::Context, dark: bool) {
     let mut style = (*ctx.style()).clone();
     {
-        // Clean, readable light theme (deterministic — not the washed-out
-        // system default). Amber accent on top.
-        let mut v = egui::Visuals::light();
-        v.panel_fill = Color32::from_rgb(0xF7, 0xF6, 0xF3);
-        v.faint_bg_color = Color32::from_rgb(0xFF, 0xFF, 0xFF);
-        v.extreme_bg_color = Color32::from_rgb(0xFF, 0xFF, 0xFF);
-        v.override_text_color = Some(Color32::from_rgb(0x22, 0x20, 0x1D));
-        v.widgets.noninteractive.bg_stroke =
-            egui::Stroke::new(1.0, Color32::from_rgb(0xE2, 0xDF, 0xD8));
+        let mut v = if dark {
+            let mut v = egui::Visuals::dark();
+            v.panel_fill = BG_DARK;
+            v.faint_bg_color = Color32::from_rgb(0x17, 0x17, 0x1A); // cards
+            v.extreme_bg_color = Color32::from_rgb(0x1E, 0x1E, 0x24); // text fields
+            v.override_text_color = Some(Color32::from_rgb(0xF2, 0xF2, 0xF2));
+            v.widgets.noninteractive.bg_stroke =
+                egui::Stroke::new(1.0, Color32::from_rgb(0x2A, 0x2A, 0x30));
+            v
+        } else {
+            let mut v = egui::Visuals::light();
+            v.panel_fill = BG_LIGHT;
+            v.faint_bg_color = Color32::from_rgb(0xFF, 0xFF, 0xFF);
+            v.extreme_bg_color = Color32::from_rgb(0xFF, 0xFF, 0xFF);
+            v.override_text_color = Some(Color32::from_rgb(0x22, 0x20, 0x1D));
+            v.widgets.noninteractive.bg_stroke =
+                egui::Stroke::new(1.0, Color32::from_rgb(0xE2, 0xDF, 0xD8));
+            v
+        };
         v.hyperlink_color = ACCENT;
         v.selection.bg_fill = ACCENT.gamma_multiply(0.35);
         let r = Rounding::same(10.0);
@@ -76,6 +92,24 @@ fn tune_theme(ctx: &egui::Context) {
     ]
     .into();
     ctx.set_style(style);
+}
+
+/// A small pill toggle switch (light ↔ dark). Flips `dark` on click.
+fn theme_toggle(ui: &mut egui::Ui, dark: &mut bool) {
+    let size = egui::vec2(40.0, 22.0);
+    let (rect, mut resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    if resp.clicked() {
+        *dark = !*dark;
+        resp.mark_changed();
+    }
+    let how = ui.ctx().animate_bool(resp.id, *dark);
+    let radius = rect.height() / 2.0;
+    let track = if *dark { ACCENT } else { Color32::from_gray(0xC4) };
+    ui.painter().rect(rect, Rounding::same(radius), track, egui::Stroke::NONE);
+    let knob_x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), how);
+    ui.painter()
+        .circle_filled(egui::pos2(knob_x, rect.center().y), radius - 3.0, Color32::WHITE);
+    resp.on_hover_text(if *dark { "Switch to light theme" } else { "Switch to dark theme" });
 }
 
 struct Running {
@@ -110,6 +144,7 @@ struct ZapApp {
     tab: Tab,
     tspeed: HashMap<u64, (Instant, u64, f64)>, // per-transfer: last sample time, bytes, smoothed speed
     shot_frames: u32,
+    dark: bool,
 }
 
 impl Default for ZapApp {
@@ -131,6 +166,7 @@ impl Default for ZapApp {
             tab: Tab::Share,
             tspeed: HashMap::new(),
             shot_frames: 0,
+            dark: std::env::var("ZAP_DARK").is_ok(), // default light; env forces dark for screenshots
         }
     }
 }
@@ -228,11 +264,11 @@ impl ZapApp {
 
 impl eframe::App for ZapApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        BG.to_normalized_gamma_f32()
+        theme_bg(self.dark).to_normalized_gamma_f32()
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        tune_theme(ctx);
+        tune_theme(ctx, self.dark);
 
         // Debug: ZAP_SHOT=<path> captures our own window to a PNG and exits.
         if let Ok(path) = std::env::var("ZAP_SHOT") {
@@ -264,7 +300,7 @@ impl eframe::App for ZapApp {
 
         // Primary action pinned to the bottom (always reachable).
         egui::TopBottomPanel::bottom("actions")
-            .frame(egui::Frame::default().fill(BG).inner_margin(Margin::symmetric(20.0, 14.0)))
+            .frame(egui::Frame::default().fill(theme_bg(self.dark)).inner_margin(Margin::symmetric(20.0, 14.0)))
             .show(ctx, |ui| {
                 let (label, fill, fg) = if running {
                     ("Stop server", ui.visuals().widgets.inactive.bg_fill, ui.visuals().text_color())
@@ -283,7 +319,7 @@ impl eframe::App for ZapApp {
                 }
             });
 
-        let panel = egui::Frame::default().fill(BG).inner_margin(Margin {
+        let panel = egui::Frame::default().fill(theme_bg(self.dark)).inner_margin(Margin {
             left: 20.0,
             right: 20.0,
             top: 14.0,
@@ -298,6 +334,10 @@ impl eframe::App for ZapApp {
                     ui.vertical(|ui| {
                         ui.label(RichText::new("Zap").size(23.0).strong());
                         ui.label(RichText::new("Lightning-fast file transfer over Wi-Fi").size(12.5).weak());
+                    });
+                    // Light/dark toggle, pinned top-right.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                        theme_toggle(ui, &mut self.dark);
                     });
                 });
                 ui.add_space(14.0);
