@@ -227,6 +227,14 @@ impl eframe::App for ZapApp {
                 if let Some(r) = &self.running {
                     ui.label(RichText::new("● Server running").size(15.0).strong().color(ACCENT));
                     ui.add_space(8.0);
+                    if r.info.lan_ip.is_none() {
+                        ui.label(
+                            RichText::new("⚠ No Wi-Fi network detected — connect to Wi-Fi, then Stop and Start again.")
+                                .size(12.5)
+                                .color(Color32::from_rgb(0xE0, 0x55, 0x4B)),
+                        );
+                        ui.add_space(6.0);
+                    }
                     let url = r.info.url();
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(&url).monospace().size(15.0));
@@ -257,6 +265,12 @@ impl eframe::App for ZapApp {
                             ui.label(RichText::new("Scan on the other device").size(11.0).color(MUTED));
                         });
                     }
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new("Both devices must be on the same Wi-Fi. If it won't connect, turn off your router's \u{201C}AP / client isolation\u{201D}.")
+                            .size(11.0)
+                            .color(MUTED),
+                    );
                 } else {
                     ui.label(RichText::new("Stopped").size(15.0).strong());
                     ui.add_space(4.0);

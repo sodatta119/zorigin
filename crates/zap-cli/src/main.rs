@@ -152,13 +152,16 @@ fn print_banner(info: &ServerInfo) {
             }
         }
         None => {
-            println!("Could not determine a LAN IP address.");
+            println!("⚠ No Wi-Fi/LAN IP detected — connect to Wi-Fi (not just a cable/hotspot).");
             println!(
                 "Serving on port {}; find this machine's Wi-Fi IP and open http://<ip>:{}/",
                 info.port, info.port
             );
         }
     }
+    println!();
+    println!("Both devices must be on the same Wi-Fi. If it won't connect,");
+    println!("turn off your router's \"AP / client isolation\" setting.");
     println!("Press Ctrl-C to stop.");
 }
 

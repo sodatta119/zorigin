@@ -4,3 +4,6 @@
 # macOS / IDE junk
 .DS_Store
 android/.idea/
+
+# local-only handoff notes
+docs/HANDOFF.md

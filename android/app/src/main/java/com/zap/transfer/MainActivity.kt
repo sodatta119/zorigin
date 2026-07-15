@@ -31,6 +31,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var urlView: TextView
     private lateinit var copiedLabel: TextView
     private lateinit var urlActions: View
+    private lateinit var hint: TextView
     private lateinit var folderPath: TextView
     private lateinit var startButton: Button
     private lateinit var stopButton: Button
@@ -72,6 +73,7 @@ class MainActivity : AppCompatActivity() {
         urlView = findViewById(R.id.url)
         copiedLabel = findViewById(R.id.copiedLabel)
         urlActions = findViewById(R.id.urlActions)
+        hint = findViewById(R.id.hint)
         folderPath = findViewById(R.id.folderPath)
         startButton = findViewById(R.id.startButton)
         stopButton = findViewById(R.id.stopButton)
@@ -124,9 +126,18 @@ class MainActivity : AppCompatActivity() {
 
     private fun render() {
         val running = ZapState.running
+        val url = ZapState.url
+        // A localhost URL means no Wi-Fi/LAN IP was found — warn instead.
+        val noWifi = running && (url == null || url.contains("localhost") || url.contains("127.0.0.1"))
         status.text = if (running) "Server running" else "Stopped"
-        urlView.text = if (running) (ZapState.url ?: "…") else "Start to share over Wi-Fi"
-        urlActions.visibility = if (running && ZapState.url != null) View.VISIBLE else View.GONE
+        urlView.text = when {
+            !running -> "Start to share over Wi-Fi"
+            noWifi -> "No Wi-Fi detected — connect to Wi-Fi, then Stop and Start again"
+            else -> url ?: "…"
+        }
+        urlView.setTextColor(if (noWifi) 0xFFE0554B.toInt() else 0xFF8A8A90.toInt())
+        urlActions.visibility = if (running && !noWifi) View.VISIBLE else View.GONE
+        hint.visibility = if (running && !noWifi) View.VISIBLE else View.GONE
 
         startButton.isEnabled = !running
         stopButton.isEnabled = running

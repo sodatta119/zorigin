@@ -132,6 +132,16 @@
                         android:contentDescription="Share link" />
                 </LinearLayout>
             </LinearLayout>
+
+            <TextView
+                android:id="@+id/hint"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:textSize="11.5sp"
+                android:textColor="#8A8A90"
+                android:visibility="gone"
+                android:text="Both devices must be on the same Wi-Fi. If it won't connect, turn off your router's “AP / client isolation”." />
         </LinearLayout>
 
         <!-- Secure card -->
