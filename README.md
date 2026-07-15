@@ -18,11 +18,11 @@ files over several links. Transports are being added simplest-first:
 Two control models coexist:
 
 - **Host-driven** transports (ADB, and later native Wi-Fi / MTP / Bluetooth)
-  implement the `Transport` trait — the Mac enumerates devices and drives
+  implement the `Transport` trait - the Mac enumerates devices and drives
   `ls`/`pull`/`push`.
 - **Server-mode** transports invert control: the Mac serves, the phone drives.
   The web transport (`zap serve`) is the first of these and needs no app on
-  the phone — just a browser.
+  the phone - just a browser.
 
 ## Install
 
@@ -71,7 +71,7 @@ Options: `--dir` (default `.`), `--port` (default `8080`), `--bind`
 ## Architecture
 
 zap is a Cargo **workspace** so the same core logic can back multiple front
-ends — the desktop CLI today, an Android app next.
+ends - the desktop CLI today, an Android app next.
 
 ```
 crates/
@@ -85,7 +85,7 @@ crates/
 ├── zap-cli/             # desktop CLI binary (`zap`)
 │   ├── src/main.rs      #   dispatch, device resolution, banner + QR
 │   └── src/cli.rs       #   clap command definitions
-└── zap-desktop/         # desktop GUI app (egui) — the "control panel"
+└── zap-desktop/         # desktop GUI app (egui) - the "control panel"
     └── src/main.rs      #   start/stop, URL + QR, folder picker, secure
 ```
 
@@ -104,10 +104,10 @@ Design rules that keep it multi-platform:
 The web transport already covers every device pairing without per-OS code: any
 device can run the server, and the client is always just a browser.
 
-- **macOS / Windows / Linux** — a `zap` CLI and a `zap-desktop` GUI app, both
+- **macOS / Windows / Linux** - a `zap` CLI and a `zap-desktop` GUI app, both
   built from one `cargo build` (`zap-core` uses only portable `std` +
   `tiny_http`). Distributed via GitHub.
-- **Android** — the phone hosts the server itself, via a Kotlin app over JNI.
+- **Android** - the phone hosts the server itself, via a Kotlin app over JNI.
 
 ### Desktop GUI
 
@@ -123,7 +123,7 @@ cargo bundle --release --package zap-desktop  # macOS .app + .dmg (needs cargo-b
 
 Installers for macOS (`.dmg`) and Windows (`.zip`) are built automatically by
 `.github/workflows/release.yml` on every `v*` git tag and attached to the
-GitHub Release. (Builds are unsigned — macOS users right-click → Open the first
+GitHub Release. (Builds are unsigned - macOS users right-click → Open the first
 time; Windows users click "More info → Run anyway" past SmartScreen.)
 
 ### Android
