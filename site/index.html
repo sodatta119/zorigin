@@ -4,10 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>zOrigin - local-first networking tools</title>
-<meta name="description" content="zOrigin builds small, fast, private networking utilities in Rust - file transfer, clipboard sync, wake-on-LAN, LAN recon. No cloud, no accounts, no fragile discovery. They just work on the same Wi-Fi.">
+<meta name="description" content="zOrigin builds small, fast, private networking utilities - file transfer, clipboard sync, wake-on-LAN, LAN recon. No cloud, no accounts, no fragile discovery. They just work on the same Wi-Fi.">
 <link rel="icon" type="image/svg+xml" href="favicon.svg">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
 <meta name="theme-color" content="#0a0c11">
+<script>if(!matchMedia('(prefers-reduced-motion:reduce)').matches)document.documentElement.classList.add('anim');</script>
 <style>
   :root {
     --bg:#0a0c11; --bg2:#0e1118; --panel:#12151d; --panel2:#171b25;
@@ -66,27 +67,38 @@
   @media (max-width:640px){ .nav-links .hide-sm{ display:none; } }
 
   /* ---- Hero ---- */
-  .hero { position:relative; padding:96px 0 52px; overflow:hidden; }
+  .hero { position:relative; padding:88px 0 64px; overflow:hidden; }
   .hero::before {
-    content:""; position:absolute; inset:-40% 0 auto 0; height:620px; z-index:-1;
+    content:""; position:absolute; inset:-40% 0 auto 0; height:660px; z-index:-1;
     background:
-      radial-gradient(680px 420px at 72% 4%, color-mix(in srgb, var(--accent) 20%, transparent), transparent 70%),
+      radial-gradient(680px 420px at 74% 6%, color-mix(in srgb, var(--accent) 20%, transparent), transparent 70%),
       radial-gradient(520px 360px at 12% 30%, color-mix(in srgb, var(--accent-2) 14%, transparent), transparent 70%);
   }
   .hero::after {
     content:""; position:absolute; inset:0; z-index:-1; opacity:.5;
     background-image:linear-gradient(var(--line-2) 1px, transparent 1px), linear-gradient(90deg, var(--line-2) 1px, transparent 1px);
     background-size:52px 52px;
-    -webkit-mask-image:radial-gradient(680px 480px at 60% 0%, #000 0%, transparent 72%);
-            mask-image:radial-gradient(680px 480px at 60% 0%, #000 0%, transparent 72%);
+    -webkit-mask-image:radial-gradient(760px 520px at 66% 6%, #000 0%, transparent 72%);
+            mask-image:radial-gradient(760px 520px at 66% 6%, #000 0%, transparent 72%);
   }
-  h1 { font-size:clamp(38px,6.4vw,68px); line-height:1.03; letter-spacing:-0.035em; font-weight:680; max-width:16ch; margin:18px 0 0; }
+  .hero-grid { display:grid; grid-template-columns:1fr minmax(360px,460px); gap:44px; align-items:center; }
+  h1 { font-size:clamp(38px,6.4vw,66px); line-height:1.03; letter-spacing:-0.035em; font-weight:680; max-width:15ch; margin:18px 0 0; }
   h1 .grad { background:linear-gradient(110deg, var(--accent), var(--accent-2)); -webkit-background-clip:text; background-clip:text; color:transparent; }
-  .lede { color:var(--muted); font-size:clamp(16px,2.1vw,19px); max-width:60ch; margin:22px 0 0; }
+  .lede { color:var(--muted); font-size:clamp(16px,2.1vw,19px); max-width:56ch; margin:22px 0 0; }
   .cta { display:flex; flex-wrap:wrap; gap:12px; margin-top:30px; }
   .meta-row { display:flex; flex-wrap:wrap; gap:8px 22px; margin-top:34px; color:var(--dim); font-size:13px; }
   .meta-row span { display:inline-flex; align-items:center; gap:7px; }
   .dot { width:6px; height:6px; border-radius:50%; background:var(--accent); }
+
+  /* ---- Hero assembly (animated) ---- */
+  .hero-visual { display:flex; justify-content:center; }
+  #assembly { width:100%; max-width:480px; height:auto; overflow:visible; transform-origin:center; }
+  #assembly g { transform-box:fill-box; transform-origin:center; }
+  @media (max-width:900px){
+    .hero { padding:64px 0 48px; }
+    .hero-grid { grid-template-columns:1fr; gap:26px; }
+    #assembly { max-width:340px; }
+  }
 
   /* ---- Section head ---- */
   section { padding:64px 0; }
@@ -143,6 +155,22 @@
   footer { border-top:1px solid var(--line-2); padding:34px 0 48px; color:var(--dim); font-size:13.5px; }
   .foot { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:14px; }
   .foot a { color:var(--muted); } .foot a:hover { color:var(--text); }
+
+  /* ---- Entrance reveals (CSS transitions; only when JS + motion allowed) ---- */
+  html.anim .anim-in,
+  html.anim .reveal,
+  html.anim .reveal[data-stagger] .r-child {
+    opacity:0; transform:translateY(20px);
+    transition:opacity .7s cubic-bezier(.2,.7,.2,1), transform .7s cubic-bezier(.2,.7,.2,1);
+  }
+  html.anim .anim-in.shown,
+  html.anim .reveal.shown,
+  html.anim .reveal[data-stagger] .r-child.shown { opacity:1; transform:none; }
+  html.anim .reveal[data-stagger] { opacity:1; transform:none; } /* container shown; children stagger */
+  html.anim #assembly { opacity:0; }
+  @media (prefers-reduced-motion:reduce){
+    html.anim .anim-in, html.anim .reveal, html.anim .reveal .r-child { opacity:1; transform:none; transition:none; }
+  }
 </style>
 </head>
 <body>
@@ -162,85 +190,148 @@
 </nav>
 
 <header class="hero">
-  <div class="wrap">
-    <span class="eyebrow">Local-first · Rust · No cloud</span>
-    <h1>Networking tools for the network you <span class="grad">already own.</span></h1>
-    <p class="lede">zOrigin builds small, fast, private utilities in Rust - move files, sync clipboards,
-      wake machines, map your LAN. No cloud. No accounts. No fragile device discovery. They just work
-      on the same Wi‑Fi, and they don't phone home.</p>
-    <div class="cta">
-      <a class="btn btn-primary" href="/zap/">Explore Zap →</a>
-      <a class="btn" href="#products">See the toolkit</a>
+  <div class="wrap hero-grid">
+    <div class="hero-copy">
+      <span class="eyebrow anim-in">Local-first · No cloud · No accounts</span>
+      <h1 class="anim-in">Networking tools for the network you <span class="grad">already own.</span></h1>
+      <p class="lede anim-in">zOrigin builds small, fast, private utilities - move files, sync clipboards,
+        wake machines, map your LAN. No cloud. No accounts. No fragile device discovery. They just work
+        on the same Wi-Fi, and they don't phone home.</p>
+      <div class="cta anim-in">
+        <a class="btn btn-primary" href="/zap/">Explore Zap →</a>
+        <a class="btn" href="#products">See the toolkit</a>
+      </div>
+      <div class="meta-row mono anim-in">
+        <span><i class="dot"></i> Files & data stay on your LAN</span>
+        <span><i class="dot"></i> One shared core</span>
+        <span><i class="dot"></i> Open-core</span>
+      </div>
     </div>
-    <div class="meta-row mono">
-      <span><i class="dot"></i> Files & data stay on your LAN</span>
-      <span><i class="dot"></i> One Rust core</span>
-      <span><i class="dot"></i> Open-core</span>
+
+    <div class="hero-visual">
+      <svg id="assembly" viewBox="0 0 600 560" fill="none" aria-hidden="true">
+        <defs>
+          <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#6d8bff"/><stop offset="1" stop-color="#9b6dff"/>
+          </linearGradient>
+          <filter id="glow" x="-70%" y="-70%" width="240%" height="240%">
+            <feGaussianBlur stdDeviation="13" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+          </filter>
+        </defs>
+
+        <g id="a-cross" stroke="url(#g)" stroke-width="1" opacity=".22">
+          <line x1="36" y1="280" x2="464" y2="280"/>
+          <line x1="250" y1="66" x2="250" y2="494"/>
+        </g>
+
+        <g id="a-bezel">
+          <circle cx="250" cy="280" r="207" stroke="url(#g)" stroke-width="14" opacity=".14" stroke-dasharray="1.6 9"/>
+          <circle cx="250" cy="280" r="214" stroke="url(#g)" stroke-width="1" opacity=".3"/>
+          <circle cx="250" cy="280" r="199" stroke="url(#g)" stroke-width="1" opacity=".3"/>
+        </g>
+
+        <g id="a-dash">
+          <circle cx="250" cy="280" r="176" stroke="url(#g)" stroke-width="1.5" opacity=".5" stroke-dasharray="7 9"/>
+        </g>
+
+        <g id="a-aperture" stroke="url(#g)">
+          <g stroke-width="2" opacity=".8">
+            <circle cx="390" cy="280" r="10" fill="var(--bg)"/>
+            <circle cx="320" cy="401" r="10" fill="var(--bg)"/>
+            <circle cx="180" cy="401" r="10" fill="var(--bg)"/>
+            <circle cx="110" cy="280" r="10" fill="var(--bg)"/>
+            <circle cx="180" cy="159" r="10" fill="var(--bg)"/>
+            <circle cx="320" cy="159" r="10" fill="var(--bg)"/>
+          </g>
+          <g fill="url(#g)" stroke="none">
+            <circle cx="390" cy="280" r="3"/><circle cx="320" cy="401" r="3"/><circle cx="180" cy="401" r="3"/>
+            <circle cx="110" cy="280" r="3"/><circle cx="180" cy="159" r="3"/><circle cx="320" cy="159" r="3"/>
+          </g>
+        </g>
+
+        <g id="a-ring">
+          <circle cx="250" cy="280" r="92" stroke="url(#g)" stroke-width="2" opacity=".7"/>
+          <circle cx="250" cy="280" r="68" stroke="url(#g)" stroke-width="1" opacity=".4" stroke-dasharray="4 6"/>
+        </g>
+
+        <g id="a-core">
+          <circle cx="250" cy="280" r="40" fill="url(#g)" opacity=".16" filter="url(#glow)"/>
+          <circle cx="250" cy="280" r="24" fill="url(#g)"/>
+          <circle cx="243" cy="272" r="8" fill="#fff" opacity=".35"/>
+        </g>
+
+        <g id="a-labels" font-family="ui-monospace,Menlo,monospace" font-size="12" letter-spacing=".04em">
+          <g class="lbl"><line x1="418" y1="168" x2="492" y2="150" stroke="url(#g)" stroke-width="1" opacity=".5"/><circle cx="418" cy="168" r="2.4" fill="url(#g)"/><text x="498" y="154" fill="var(--muted)">pair</text></g>
+          <g class="lbl"><line x1="440" y1="250" x2="498" y2="240" stroke="url(#g)" stroke-width="1" opacity=".5"/><circle cx="440" cy="250" r="2.4" fill="url(#g)"/><text x="504" y="244" fill="var(--muted)">stream</text></g>
+          <g class="lbl"><line x1="440" y1="320" x2="498" y2="330" stroke="url(#g)" stroke-width="1" opacity=".5"/><circle cx="440" cy="320" r="2.4" fill="url(#g)"/><text x="504" y="334" fill="var(--muted)">verify</text></g>
+          <g class="lbl"><line x1="410" y1="400" x2="486" y2="420" stroke="url(#g)" stroke-width="1" opacity=".5"/><circle cx="410" cy="400" r="2.4" fill="url(#g)"/><text x="492" y="424" fill="var(--muted)">private</text></g>
+        </g>
+      </svg>
     </div>
   </div>
 </header>
 
 <section id="products">
   <div class="wrap">
-    <div class="sec-head">
+    <div class="sec-head reveal">
       <span class="eyebrow">Products</span>
       <h2>One platform, a growing toolkit.</h2>
       <p>Each tool does one job and does it reliably. They share the same engine - so pairing,
         speed and privacy work the same everywhere.</p>
     </div>
-    <div class="grid">
+    <div class="grid reveal" data-stagger>
 
-      <a class="card" href="/zap/" style="--c:var(--amber)">
+      <a class="card r-child" href="/zap/" style="--c:var(--amber)">
         <div class="card-top">
           <div class="mk-sq">⚡</div>
           <div><h3>Zap</h3><div class="role">File & folder transfer</div></div>
           <span class="pill live" style="margin-left:auto">Live</span>
         </div>
-        <p>Move huge files and whole folders across devices over Wi‑Fi - at full local speed.
+        <p>Move huge files and whole folders across devices over Wi-Fi - at full local speed.
           The other device just opens a link. No app on the receiver.</p>
         <div class="card-foot"><span class="card-link">Open Zap →</span></div>
       </a>
 
-      <div class="card soon" style="--c:var(--z-zulu)">
+      <div class="card soon r-child" style="--c:var(--z-zulu)">
         <div class="card-top">
           <div class="mk-sq">Z</div>
           <div><h3>Zulu</h3><div class="role">Clipboard & link sync</div></div>
           <span class="pill" style="margin-left:auto">Soon</span>
         </div>
         <p>Your clipboard, links and snippets - synced across every device. Copy here, paste there.
-          “Zulu time”: everything stays in sync.</p>
+          "Zulu time": everything stays in sync.</p>
         <div class="card-foot"><span class="card-link">In development</span></div>
       </div>
 
-      <div class="card soon" style="--c:var(--z-zeus)">
+      <div class="card soon r-child" style="--c:var(--z-zeus)">
         <div class="card-top">
           <div class="mk-sq">Z</div>
           <div><h3>Zeus</h3><div class="role">Wake & power control</div></div>
           <span class="pill" style="margin-left:auto">Soon</span>
         </div>
-        <p>Wake, restart or shut down your machines from your phone - Wake‑on‑LAN plus SSH,
+        <p>Wake, restart or shut down your machines from your phone - Wake-on-LAN plus SSH,
           straight over your network.</p>
         <div class="card-foot"><span class="card-link">In development</span></div>
       </div>
 
-      <div class="card soon" style="--c:var(--z-zod)">
+      <div class="card soon r-child" style="--c:var(--z-zod)">
         <div class="card-top">
           <div class="mk-sq">Z</div>
           <div><h3>Zod</h3><div class="role">LAN recon</div></div>
           <span class="pill" style="margin-left:auto">Soon</span>
         </div>
-        <p>See and inspect every device on your Wi‑Fi - IP, MAC, vendor, open ports, latency.
+        <p>See and inspect every device on your Wi-Fi - IP, MAC, vendor, open ports, latency.
           A fast, private network map.</p>
         <div class="card-foot"><span class="card-link">In development</span></div>
       </div>
 
-      <div class="card soon" style="--c:var(--z-zeta)">
+      <div class="card soon r-child" style="--c:var(--z-zeta)">
         <div class="card-top">
           <div class="mk-sq">Z</div>
           <div><h3>Zeta</h3><div class="role">Phone as trackpad</div></div>
           <span class="pill" style="margin-left:auto">Soon</span>
         </div>
-        <p>Turn your phone into a wireless trackpad and keyboard for any PC - low‑latency input
+        <p>Turn your phone into a wireless trackpad and keyboard for any PC - low-latency input
           over the LAN, no screen streaming.</p>
         <div class="card-foot"><span class="card-link">In development</span></div>
       </div>
@@ -251,29 +342,29 @@
 
 <section class="band" id="philosophy">
   <div class="wrap">
-    <div class="sec-head">
+    <div class="sec-head reveal">
       <span class="eyebrow">Philosophy</span>
       <h2>Built on a few stubborn principles.</h2>
     </div>
-    <div class="principles">
-      <div class="principle"><div class="n">01</div><h4>Local-first</h4><p>Your files and data stay on your own network. No cloud relay, no servers we operate, nothing to leak.</p></div>
-      <div class="principle"><div class="n">02</div><h4>No accounts</h4><p>Nothing to sign up for. Pair two devices with a QR or a link and you're done.</p></div>
-      <div class="principle"><div class="n">03</div><h4>No fragile discovery</h4><p>We never rely on mDNS, BLE or multicast - the exact things home routers quietly break. That's why it works when others don't.</p></div>
-      <div class="principle"><div class="n">04</div><h4>Honest engineering</h4><p>Speed is your Wi‑Fi's real speed, not marketing. We tell you the limits - including where the OS gets in the way.</p></div>
+    <div class="principles reveal" data-stagger>
+      <div class="principle r-child"><div class="n">01</div><h4>Local-first</h4><p>Your files and data stay on your own network. No cloud relay, no servers we operate, nothing to leak.</p></div>
+      <div class="principle r-child"><div class="n">02</div><h4>No accounts</h4><p>Nothing to sign up for. Pair two devices with a QR or a link and you're done.</p></div>
+      <div class="principle r-child"><div class="n">03</div><h4>No fragile discovery</h4><p>We never rely on mDNS, BLE or multicast - the exact things home routers quietly break. That's why it works when others don't.</p></div>
+      <div class="principle r-child"><div class="n">04</div><h4>Honest engineering</h4><p>Speed is your Wi-Fi's real speed, not marketing. We tell you the limits - including where the OS gets in the way.</p></div>
     </div>
   </div>
 </section>
 
 <section>
   <div class="wrap">
-    <div class="engine">
+    <div class="engine reveal">
       <span class="eyebrow">The engine</span>
-      <h2 style="font-size:clamp(24px,3.2vw,32px);letter-spacing:-0.03em;margin-top:12px;">One Rust core under every tool.</h2>
-      <p style="color:var(--muted);max-width:62ch;margin-top:12px;">Every zOrigin app shares the same foundation - explicit pairing, a lean LAN transport, resumable and verified transfers. Reliability isn't a feature we bolt on; it's the core.</p>
+      <h2 style="font-size:clamp(24px,3.2vw,32px);letter-spacing:-0.03em;margin-top:12px;">One shared core under every tool.</h2>
+      <p style="color:var(--muted);max-width:62ch;margin-top:12px;">Every zOrigin app is built on the same foundation - explicit pairing, a lean LAN transport, resumable and verified transfers. Reliability isn't a feature we bolt on; it's the whole idea.</p>
       <div class="code">
-        <b>pair</b> &nbsp;→&nbsp; QR / URL / one‑time token &nbsp;<span style="opacity:.6">(never mDNS or BLE)</span><br>
+        <b>pair</b> &nbsp;→&nbsp; QR / URL / one-time token &nbsp;<span style="opacity:.6">(never mDNS or BLE)</span><br>
         <b>transport</b> &nbsp;→&nbsp; plain HTTP on the LAN, streamed, resumable<br>
-        <b>verify</b> &nbsp;→&nbsp; crc32 on arrival &nbsp;<span style="opacity:.6">- byte‑exact or it retries</span><br>
+        <b>verify</b> &nbsp;→&nbsp; crc32 on arrival &nbsp;<span style="opacity:.6">- byte-exact or it retries</span><br>
         <b>privacy</b> &nbsp;→&nbsp; nothing leaves the subnet
       </div>
     </div>
@@ -286,10 +377,103 @@
       <svg class="mk" style="width:22px;height:22px" viewBox="0 0 32 32"><rect width="32" height="32" rx="8" fill="var(--panel2)" stroke="var(--line)"/><circle cx="16" cy="16" r="10.5" fill="none" stroke="#6d8bff" stroke-width="1.3" opacity=".3"/><circle cx="16" cy="16" r="6.5" fill="none" stroke="#6d8bff" stroke-width="1.5" opacity=".65"/><circle cx="16" cy="16" r="2.8" fill="#6d8bff"/></svg>
       <span>z<b style="color:var(--accent)">O</b>rigin</span>
     </span>
-    <span>Local-first networking tools · built in Rust</span>
+    <span>Local-first networking tools · no cloud, no accounts</span>
     <a href="/zap/privacy.html">Privacy</a>
   </div>
 </footer>
+
+<script src="anime.min.js"></script>
+<script>
+(function () {
+  var root = document.documentElement;
+  var reduce = matchMedia('(prefers-reduced-motion:reduce)').matches;
+  if (reduce) { root.classList.remove('anim'); return; } // no motion -> CSS shows everything
+
+  // --- Text + section reveals: pure CSS transitions (rAF-independent, robust) ---
+  // Hero copy: staggered on load.
+  document.querySelectorAll('.hero-copy .anim-in').forEach(function (el, i) {
+    setTimeout(function () { el.classList.add('shown'); }, 120 + i * 95);
+  });
+  // Sections: reveal when scrolled into view.
+  if ('IntersectionObserver' in window) {
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (!e.isIntersecting) return;
+        var el = e.target; io.unobserve(el);
+        if (el.hasAttribute('data-stagger')) {
+          el.querySelectorAll('.r-child').forEach(function (k, i) {
+            setTimeout(function () { k.classList.add('shown'); }, i * 80);
+          });
+        } else { el.classList.add('shown'); }
+      });
+    }, { threshold: 0.16, rootMargin: '0px 0px -8% 0px' });
+    document.querySelectorAll('.reveal').forEach(function (el) { io.observe(el); });
+  } else {
+    document.querySelectorAll('.reveal, .r-child').forEach(function (el) { el.classList.add('shown'); });
+  }
+
+  // --- The animated origin assembly (anime.js showcase) ---
+  var svg = document.querySelector('#assembly');
+  if (typeof anime === 'undefined') { if (svg) svg.style.opacity = 1; return; } // anime missing -> show it static
+
+  var PARTS = ['#a-bezel', '#a-dash', '#a-aperture', '#a-ring', '#a-cross', '#a-core'];
+
+  // Intro: the parts fly in and assemble into the origin mark.
+  var intro = anime.timeline({ easing: 'easeOutExpo' })
+    .add({ targets: '#assembly', opacity: [0, 1], scale: [0.86, 1], duration: 900 }, 150)
+    .add({ targets: '#a-bezel',    rotate: [-55, 0], scale: [0.6, 1], opacity: [0, 1], duration: 1200 }, 250)
+    .add({ targets: '#a-dash',     rotate: [80, 0],  scale: [0.5, 1], opacity: [0, 1], duration: 1200 }, 320)
+    .add({ targets: '#a-aperture', rotate: [45, 0],  scale: [1.9, 1], opacity: [0, 1], duration: 1100 }, 400)
+    .add({ targets: '#a-ring',     scale: [0.4, 1],  opacity: [0, 1], duration: 1000 }, 460)
+    .add({ targets: '#a-cross',    scale: [1.5, 1],  opacity: [0, 1], duration: 1000 }, 500)
+    .add({ targets: '#a-core',     scale: [0, 1],    opacity: [0, 1], duration: 900, easing: 'easeOutBack' }, 560)
+    .add({ targets: '#a-labels .lbl', opacity: [0, 1], translateX: [-8, 0], duration: 700, delay: anime.stagger(90) }, 900);
+
+  // Scroll-scrubbed explode / reassemble (the "camera" effect).
+  var boom = anime.timeline({ autoplay: false, easing: 'easeInOutSine' });
+  function part(t, mid) {
+    boom.add({ targets: t, keyframes: [
+      Object.assign({ duration: 500 }, mid),
+      { scale: 1, rotate: 0, opacity: mid._rest, duration: 500 },
+    ] }, 0);
+  }
+  part('#a-bezel',    { scale: 1.34, rotate: 38,  opacity: 0.85, _rest: 1 });
+  part('#a-dash',     { scale: 1.62, rotate: -58, opacity: 0.5,  _rest: 1 });
+  part('#a-aperture', { scale: 1.85, rotate: 66,  opacity: 0.85, _rest: 1 });
+  part('#a-ring',     { scale: 1.22, rotate: -30, opacity: 0.8,  _rest: 1 });
+  part('#a-cross',    { scale: 1.7,  rotate: 0,   opacity: 0.08, _rest: 1 });
+  part('#a-core',     { scale: 0.84, rotate: 0,   opacity: 1,    _rest: 1 });
+  boom.add({ targets: '#a-labels', keyframes: [
+    { translateX: 20, opacity: 0.15, duration: 500 },
+    { translateX: 0, opacity: 1, duration: 500 },
+  ] }, 0);
+
+  function revealAssembly() {
+    anime.set('#assembly', { opacity: 1, scale: 1 });
+    anime.set(PARTS, { opacity: 1, scale: 1, rotate: 0 });
+    anime.set('#a-labels', { opacity: 1, translateX: 0 });
+    anime.set('#a-labels .lbl', { opacity: 1, translateX: 0 });
+  }
+
+  var ready = false;
+  function onScroll() {
+    if (!ready) return;
+    var span = window.innerHeight * 1.5; // gentle, gradual scrub
+    var p = Math.min(1, Math.max(0, window.scrollY / span));
+    boom.seek(boom.duration * p);
+  }
+  function activate() { if (!ready) { ready = true; onScroll(); } }
+  intro.finished.then(activate);
+  // Safety net: guarantee the hero visual is shown even if rAF is throttled.
+  setTimeout(function () {
+    if (parseFloat(getComputedStyle(svg).opacity) < 0.9) revealAssembly();
+    activate();
+  }, 2600);
+
+  window.addEventListener('scroll', onScroll, { passive: true });
+  window.addEventListener('resize', onScroll, { passive: true });
+})();
+</script>
 
 </body>
 </html>
