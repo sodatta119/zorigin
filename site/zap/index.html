@@ -7,7 +7,7 @@
 <meta name="description" content="Move huge files between Android, Mac, Windows and Linux over your own Wi-Fi at full local speed. No app on the other device, no cloud, no accounts.">
 <link rel="icon" type="image/svg+xml" href="favicon.svg">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
-<meta name="theme-color" content="#f5a623">
+<meta name="theme-color" content="#d9932a">
 <style>
   /* ---- Tokens: warm, amber-biased dark; light theme mirrors it ---- */
   :root {
@@ -17,8 +17,8 @@
     --line:    #322a1e;
     --ink:     #f5efe4;
     --muted:   #a89f8d;
-    --accent:  #f5a623;
-    --accent-2:#ff8c42;
+    --accent:  #d9932a;
+    --accent-2:#d9932a;
     --ok:      #45b374;
     --shadow:  0 22px 60px -30px rgba(0,0,0,.8);
     color-scheme: dark;
@@ -32,7 +32,7 @@
       --ink:     #241f16;
       --muted:   #7a705d;
       --accent:  #c9791a;
-      --accent-2:#e06a1f;
+      --accent-2:#c9791a;
       --ok:      #2e8f56;
       --shadow:  0 22px 60px -34px rgba(120,90,20,.35);
       color-scheme: light;
@@ -40,12 +40,12 @@
   }
   :root[data-theme="dark"] {
     --ground:#12100c; --ground-2:#1a1610; --card:#201b13; --line:#322a1e;
-    --ink:#f5efe4; --muted:#a89f8d; --accent:#f5a623; --accent-2:#ff8c42; --ok:#45b374;
+    --ink:#f5efe4; --muted:#a89f8d; --accent:#d9932a; --accent-2:#d9932a; --ok:#45b374;
     --shadow:0 22px 60px -30px rgba(0,0,0,.8); color-scheme: dark;
   }
   :root[data-theme="light"] {
     --ground:#f7f3ea; --ground-2:#f2ecdf; --card:#fffdf8; --line:#e6dcc9;
-    --ink:#241f16; --muted:#7a705d; --accent:#c9791a; --accent-2:#e06a1f; --ok:#2e8f56;
+    --ink:#241f16; --muted:#7a705d; --accent:#c9791a; --accent-2:#c9791a; --ok:#2e8f56;
     --shadow:0 22px 60px -34px rgba(120,90,20,.35); color-scheme: light;
   }
 
@@ -76,8 +76,7 @@
   .brand { display: flex; align-items: center; gap: 11px; font-weight: 750; font-size: 20px; letter-spacing: -.01em; }
   .bolt {
     width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center;
-    background: linear-gradient(150deg, var(--accent), var(--accent-2));
-    box-shadow: 0 6px 18px -6px color-mix(in srgb, var(--accent) 70%, transparent);
+    background: var(--accent);
   }
   .bolt svg { width: 19px; height: 19px; }
   .nav { display: flex; gap: 26px; align-items: center; font-size: 14.5px; color: var(--muted); }
@@ -91,8 +90,7 @@
     padding: 12px 22px; border-radius: 11px; border: 1px solid transparent;
   }
   .btn-primary {
-    color: #1a1204; background: linear-gradient(150deg, var(--accent), var(--accent-2));
-    box-shadow: 0 10px 26px -10px color-mix(in srgb, var(--accent) 72%, transparent);
+    color: #1a1204; background: var(--accent);
   }
   .btn-primary:hover { filter: brightness(1.05); }
   .btn-ghost { color: var(--ink); border-color: var(--line); background: var(--ground-2); }
@@ -124,8 +122,7 @@
   }
   .pkt {
     position: absolute; top: 50%; left: 0; width: 34px; height: 10px; transform: translate(-50%,-50%);
-    border-radius: 6px; background: linear-gradient(90deg, var(--accent), var(--accent-2));
-    box-shadow: 0 0 16px 1px color-mix(in srgb, var(--accent) 60%, transparent);
+    border-radius: 6px; background: var(--accent);
     animation: fly 2.6s cubic-bezier(.55,0,.45,1) infinite;
   }
   @keyframes fly {
@@ -135,7 +132,7 @@
     100% { left: 98%; opacity: 0; }
   }
   .verified { margin-top: 22px; display: inline-flex; align-items: center; gap: 8px; color: var(--ok); font-size: 13.5px; font-weight: 600; }
-  .verified .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 10px var(--ok); }
+  .verified .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
   @media (prefers-reduced-motion: reduce) { .pkt { animation: none; left: 50%; } }
 
   /* ---- Generic section head ---- */
