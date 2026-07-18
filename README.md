@@ -1,152 +1,54 @@
-# Zap⚡ 
+# zOrigin
 
-Fast file transfer between Android devices and macOS - a Rust CLI.
+Private-first, local-first software that just works on your own network - no
+cloud, no accounts, no discovery flakiness. One Rust engine per category, many
+focused apps on top.
 
-## Status
+**https://zorigin.net**
 
-`zap` is built around a pluggable `Transport` trait so the same CLI can move
-files over several links. Transports are being added simplest-first:
+## The model
 
-| Transport         | Android side needed        | Status      |
-| ----------------- | -------------------------- | ----------- |
-| **USB (ADB)**     | Developer mode only        | ✅ working  |
-| **Wi-Fi (web)**   | A browser                  | ✅ working  |
-| Wi-Fi (native)    | Companion agent (TBD)      | planned     |
-| USB (MTP)         | None                       | planned     |
-| Bluetooth         | Companion agent (TBD)      | planned     |
+zOrigin is an umbrella over **categories**; each category has its own engine and
+its own products. Networking is category #1; other, non-networking categories
+will come later with their own separate core.
 
-Two control models coexist:
-
-- **Host-driven** transports (ADB, and later native Wi-Fi / MTP / Bluetooth)
-  implement the `Transport` trait - the Mac enumerates devices and drives
-  `ls`/`pull`/`push`.
-- **Server-mode** transports invert control: the Mac serves, the phone drives.
-  The web transport (`zap serve`) is the first of these and needs no app on
-  the phone - just a browser.
-
-## Install
-
-Requires the `adb` binary for the USB transport:
-
-```sh
-brew install android-platform-tools
+```
+zOrigin
+└── networking   (category #1)  - engine: znet-core
+    ├── Zap      (live)
+    └── Zulu / Zeus / Zod / Zeta  (planned)
 ```
 
-`zap` finds `adb` via `$ZAP_ADB`, then `$ANDROID_HOME/platform-tools/adb`, then `$PATH`.
+## Products
 
-Build (the Cargo workspace lives under `networking/`, the zOrigin category layout):
+| Product | Category | What it does | Status |
+| --- | --- | --- | --- |
+| **Zap** | networking | Cross-platform file & folder transfer over local Wi-Fi - the receiver just opens a link in a browser, no app needed | ✅ Live |
+| **Zulu** | networking | Clipboard & link sync - copy on one device, it's instantly on your others | Planned |
+| **Zeus** | networking | Wake & power control - turn your PCs on and off from your phone | Planned |
+| **Zod** | networking | LAN recon - see and inspect everything on your Wi-Fi | Planned |
+| **Zeta** | networking | Phone as a trackpad for your computer | Planned |
+
+## Repo layout
+
+```
+zorigin/
+├── networking/   # category #1: Cargo workspace (znet-core engine + Zap cli/desktop/android)
+│                 #   -> see networking/README.md for build, run, and app details
+├── site/         # the zOrigin website (zorigin.net), served by Cloudflare.  / = zOrigin, /zap = Zap
+└── docs/         # roadmap, backlog, and per-product briefs (docs/apps/)
+```
+
+Categories are folders so a future non-networking category simply adds its own
+top-level directory (with its own core), without disturbing `networking/`.
+
+## Build
+
+The code lives under `networking/` (the networking category's Cargo workspace):
 
 ```sh
 cd networking && cargo build --release
 ```
 
-## Usage
-
-```sh
-zap devices                          # list connected devices
-zap ls /sdcard/DCIM                  # list a directory on the phone
-zap pull /sdcard/DCIM/photo.jpg .    # phone -> Mac
-zap push ~/song.mp3 /sdcard/Music/   # Mac -> phone
-```
-
-When exactly one device is connected it's selected automatically; otherwise
-pass `--device <serial>`. Choose a transport with `--transport <name>`
-(default: `adb`).
-
-### Wi-Fi via the browser (no app)
-
-```sh
-zap serve --dir ~/Downloads          # share ~/Downloads over Wi-Fi
-```
-
-`zap serve` prints a URL and a QR code. On a phone connected to the same
-Wi-Fi, scan the QR (or open the URL) to get a page that can:
-
-- **upload** files to the Mac (they land in `--dir`), and
-- **download** any file the Mac is sharing from `--dir`.
-
-Options: `--dir` (default `.`), `--port` (default `8080`), `--bind`
-(default `0.0.0.0`).
-
-## Architecture
-
-zap is a Cargo **workspace** so the same core logic can back multiple front
-ends - the desktop CLI today, an Android app next. The repo uses the zOrigin
-category layout: the workspace lives under `networking/` (category #1), with
-the whole-company site at repo-top `site/`.
-
-```
-networking/              # category #1 (Cargo workspace root)
-└── crates/
-    ├── znet-core/       # platform-neutral logic; no terminal/UI concerns
-    │   ├── src/transport/   #   Transport trait + AdbTransport (host-driven)
-    │   │   ├── mod.rs       #     trait, Device, RemoteEntry
-    │   │   └── adb.rs       #     shells out to `adb`
-    │   └── src/web/         #   web transport (server-mode)
-    │       ├── mod.rs       #     tiny_http server: serve(config, on_ready)
-    │       └── index.html   #     phone-facing page, embedded via include_str!
-    ├── zap-cli/         # desktop CLI binary (`zap`)
-    │   ├── src/main.rs      #   dispatch, device resolution, banner + QR
-    │   └── src/cli.rs       #   clap command definitions
-    └── zap-desktop/     # desktop GUI app (egui) - the "control panel"
-        └── src/main.rs      #   start/stop, URL + QR, folder picker, secure
-```
-
-Design rules that keep it multi-platform:
-
-- **`znet-core` does no presentation.** `web::serve` takes an `on_ready`
-  callback and hands back a `ServerInfo` (share dir, port, LAN IP, `url()`);
-  the *caller* decides how to show it. The CLI prints a banner + terminal QR;
-  an Android app will render its own UI. The terminal-only `qrcode` dependency
-  lives in `zap-cli`, not the core.
-- Adding a host-driven transport = one new `impl Transport` plus a variant in
-  `TransportKind`; the CLI commands don't change.
-
-### Cross-platform reach
-
-The web transport already covers every device pairing without per-OS code: any
-device can run the server, and the client is always just a browser.
-
-- **macOS / Windows / Linux** - a `zap` CLI and a `zap-desktop` GUI app, both
-  built from one `cargo build` (`znet-core` uses only portable `std` +
-  `tiny_http`). Distributed via GitHub.
-- **Android** - the phone hosts the server itself, via a Kotlin app over JNI.
-
-### Desktop GUI
-
-`networking/crates/zap-desktop` is an [egui](https://github.com/emilk/egui) app:
-a small control panel (start/stop, share-folder picker, "require password", live
-URL + scannable QR) that calls `znet_core::web::spawn`. Other devices connect
-through the browser at the shown URL.
-
-```sh
-cd networking
-cargo run --release --package zap-desktop     # run locally
-cargo bundle --release --package zap-desktop  # macOS .app + .dmg (needs cargo-bundle)
-```
-
-Installers for macOS (`.dmg`) and Windows (`.zip`) are built automatically by
-`.github/workflows/release.yml` on every `v*` git tag and attached to the
-GitHub Release. (Builds are unsigned - macOS users right-click → Open the first
-time; Windows users click "More info → Run anyway" past SmartScreen.)
-
-### Android
-
-`networking/crates/zap-android` is a `cdylib` that exposes `znet_core::web::spawn`
-to Kotlin through three JNI calls (`nativeStart` / `nativeUrl` / `nativeStop`). A
-foreground service keeps the server alive on the home Wi-Fi. Because `znet-core`
-is presentation-free, the phone runs the exact same server code as the desktop.
-
-Building the `.so` needs the Android toolchain (kept out of the default desktop
-build):
-
-```sh
-# one-time
-rustup target add aarch64-linux-android armv7-linux-androideabi \
-                  x86_64-linux-android i686-linux-android
-cargo install cargo-ndk
-# with Android Studio's NDK installed and $ANDROID_NDK_HOME set (run from networking/):
-cd networking
-cargo ndk -t arm64-v8a -t armeabi-v7a -o android/zap/app/src/main/jniLibs \
-    build -p zap-android --release
-```
+See [`networking/README.md`](networking/README.md) for per-app build/run, the
+Android (`cargo-ndk` + Gradle) flow, and the installer/distribution setup.
