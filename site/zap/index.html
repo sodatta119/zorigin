@@ -88,6 +88,11 @@
     background: var(--accent);
   }
   .bolt svg { width: 19px; height: 19px; }
+  .lockup { display: flex; align-items: center; gap: 14px; margin-bottom: 22px; }
+  .lockup .bolt { width: 50px; height: 50px; border-radius: 13px; }
+  .lockup .bolt svg { width: 27px; height: 27px; }
+  .lockup .nm { font-size: 26px; font-weight: 750; letter-spacing: -.02em; }
+  .lockup .role { font-size: 13px; color: var(--muted); font-family: ui-monospace, Menlo, monospace; margin-top: 1px; }
   .nav { display: flex; gap: 26px; align-items: center; font-size: 14.5px; color: var(--muted); }
   .nav a { text-decoration: none; }
   .nav a:hover { color: var(--ink); }
@@ -247,6 +252,7 @@
     </a>
     <nav class="nav">
       <span class="tag-name hide-sm">/ Zap</span>
+      <a href="/">← All tools</a>
       <a class="hide-sm" href="#problem">Why</a>
       <a class="hide-sm" href="#how">How it works</a>
       <a class="hide-sm" href="#features">Features</a>
@@ -257,6 +263,10 @@
 
 <main>
   <section class="wrap hero">
+    <div class="lockup">
+      <span class="bolt"><svg viewBox="0 0 24 24" fill="#1a1204"><path d="M13 2 4.5 13.5H11l-1 8.5L19.5 10H13l0-8z"/></svg></span>
+      <div><div class="nm">Zap</div><div class="role">File &amp; folder transfer</div></div>
+    </div>
     <p class="eyebrow">Local file transfer · no cloud</p>
     <h1>High speed <span style="white-space:nowrap">cross-platform</span> AirDrop<br>that <span class="glow">actually works.</span></h1>
     <p class="lede">Move huge files between Android, Mac, Windows and Linux over your own Wi-Fi,
