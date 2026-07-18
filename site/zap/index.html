@@ -19,34 +19,36 @@
     --muted:   #a89f8d;
     --accent:  #d9932a;
     --accent-2:#d9932a;
+    --accent-fill:#d9932a;
     --ok:      #45b374;
     --shadow:  0 22px 60px -30px rgba(0,0,0,.8);
     color-scheme: dark;
   }
   @media (prefers-color-scheme: light) {
     :root {
-      --ground:  #ece7dd;
-      --ground-2:#e6e1d6;
-      --card:    #f6f3ec;
-      --line:    #ddd5c5;
-      --ink:     #2a2314;
-      --muted:   #7c705a;
-      --accent:  #bd7016;
-      --accent-2:#bd7016;
+      --ground:  #f2f4f7;
+      --ground-2:#e9edf2;
+      --card:    #ffffff;
+      --line:    #e0e5ec;
+      --ink:     #1e222b;
+      --muted:   #5c6573;
+      --accent:  #c9791a;
+      --accent-2:#c9791a;
+      --accent-fill:#d9932a;
       --ok:      #2e8f56;
-      --shadow:  0 22px 60px -34px rgba(120,90,20,.38);
+      --shadow:  0 22px 60px -34px rgba(20,28,55,.20);
       color-scheme: light;
     }
   }
   :root[data-theme="dark"] {
     --ground:#12100c; --ground-2:#1a1610; --card:#201b13; --line:#322a1e;
-    --ink:#f5efe4; --muted:#a89f8d; --accent:#d9932a; --accent-2:#d9932a; --ok:#45b374;
+    --ink:#f5efe4; --muted:#a89f8d; --accent:#d9932a; --accent-2:#d9932a; --accent-fill:#d9932a; --ok:#45b374;
     --shadow:0 22px 60px -30px rgba(0,0,0,.8); color-scheme: dark;
   }
   :root[data-theme="light"] {
-    --ground:#ece7dd; --ground-2:#e6e1d6; --card:#f6f3ec; --line:#ddd5c5;
-    --ink:#2a2314; --muted:#7c705a; --accent:#bd7016; --accent-2:#bd7016; --ok:#2e8f56;
-    --shadow:0 22px 60px -34px rgba(120,90,20,.38); color-scheme: light;
+    --ground:#f2f4f7; --ground-2:#e9edf2; --card:#ffffff; --line:#e0e5ec;
+    --ink:#1e222b; --muted:#5c6573; --accent:#c9791a; --accent-2:#c9791a; --accent-fill:#d9932a; --ok:#2e8f56;
+    --shadow:0 22px 60px -34px rgba(20,28,55,.20); color-scheme: light;
   }
 
   * { box-sizing: border-box; }
@@ -85,7 +87,7 @@
   .tag-name { font-family: ui-monospace, Menlo, monospace; font-size: 13px; color: var(--muted); }
   .bolt {
     width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center;
-    background: var(--accent);
+    background: var(--accent-fill);
   }
   .bolt svg { width: 19px; height: 19px; }
   .lockup { display: flex; align-items: center; gap: 14px; margin-bottom: 22px; }
@@ -104,7 +106,7 @@
     padding: 12px 22px; border-radius: 11px; border: 1px solid transparent;
   }
   .btn-primary {
-    color: #1a1204; background: var(--accent);
+    color: #1a1204; background: var(--accent-fill);
   }
   .btn-primary:hover { filter: brightness(1.05); }
   .btn-ghost { color: var(--ink); border-color: var(--line); background: var(--ground-2); }
