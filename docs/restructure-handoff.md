@@ -4,8 +4,17 @@
 > be picked up in a fresh chat (revert-and-resume). Everything needed to continue is
 > here; the general project context is in `docs/HANDOFF.md`.
 >
-> **Status: PLAN AGREED IN PRINCIPLE, NOT YET EXECUTED.** Two things still need the
-> owner's explicit go (see §5) before touching files.
+> **Status: EXECUTED (2026-07-18).** Local restructure done + verified: workspace
+> moved to `networking/`, `android/` -> `networking/android/zap/`, core crate
+> renamed `zap-core` -> **`znet-core`** (owner's pick). `site/` and `docs/` stayed
+> at repo top. `scripts/build-dist.sh` + `.github/workflows/release.yml` +
+> `.gitignore` updated for the new paths. **GitHub repo rename `zap` -> `zorigin`
+> deliberately deferred** (keeps the Cloudflare git connection + deploy intact).
+>
+> Verified: `cargo test -p znet-core --lib` = 13/13 green; `cargo build` green;
+> `./scripts/build-dist.sh` produced the universal `.dmg` + CLI at repo-root
+> `dist/`; `.so` rebuilt via cargo-ndk; APK rebuilt + reinstalled + launches clean
+> on device. Cloudflare untouched (no config file in repo; `site/` unmoved).
 
 ---
 

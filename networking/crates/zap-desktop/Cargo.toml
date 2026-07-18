@@ -10,7 +10,7 @@ name = "zap-desktop"
 path = "src/main.rs"
 
 [dependencies]
-zap-core.workspace = true
+znet-core.workspace = true
 anyhow.workspace = true
 qrcode.workspace = true
 eframe = "0.29"

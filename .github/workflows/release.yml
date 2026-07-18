@@ -19,15 +19,16 @@ jobs:
       - name: Install cargo-bundle
         run: cargo install cargo-bundle --locked
       - name: Build .app + .dmg
-        working-directory: crates/zap-desktop
+        working-directory: networking/crates/zap-desktop
         run: cargo bundle --release
       - name: Build CLI
+        working-directory: networking
         run: cargo build --release --package zap-cli
       - name: Collect artifacts
         run: |
           mkdir -p dist
-          cp target/release/bundle/dmg/zap.dmg dist/zap-macos.dmg
-          cp target/release/zap dist/zap-macos-cli
+          cp networking/target/release/bundle/dmg/zap.dmg dist/zap-macos.dmg
+          cp networking/target/release/zap dist/zap-macos-cli
       - uses: softprops/action-gh-release@v2
         with:
           files: |
@@ -41,13 +42,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build GUI + CLI
+        working-directory: networking
         run: cargo build --release --package zap-desktop --package zap-cli
       - name: Package zip
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target/release/zap-desktop.exe dist/
-          Copy-Item target/release/zap.exe dist/zap-cli.exe
+          Copy-Item networking/target/release/zap-desktop.exe dist/
+          Copy-Item networking/target/release/zap.exe dist/zap-cli.exe
           Compress-Archive -Path dist/* -DestinationPath dist/zap-windows.zip -Force
       - uses: softprops/action-gh-release@v2
         with:
@@ -67,15 +69,16 @@ jobs:
       - name: Install cargo-bundle
         run: cargo install cargo-bundle --locked
       - name: Build .deb + CLI
+        working-directory: networking
         run: |
           ( cd crates/zap-desktop && cargo bundle --release --format deb )
           cargo build --release --package zap-cli
       - name: Collect artifacts
         run: |
           mkdir -p dist
-          cp target/release/bundle/deb/*.deb dist/zap-linux.deb
-          cp target/release/zap-desktop dist/zap-linux
-          cp target/release/zap dist/zap-linux-cli
+          cp networking/target/release/bundle/deb/*.deb dist/zap-linux.deb
+          cp networking/target/release/zap-desktop dist/zap-linux
+          cp networking/target/release/zap dist/zap-linux-cli
           tar -C dist -czf dist/zap-linux.tar.gz zap-linux zap-linux-cli
       - uses: softprops/action-gh-release@v2
         with:

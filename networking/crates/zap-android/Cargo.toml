@@ -11,5 +11,5 @@ name = "zap_android"
 crate-type = ["cdylib"]
 
 [dependencies]
-zap-core.workspace = true
+znet-core.workspace = true
 jni.workspace = true

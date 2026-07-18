@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
 # Build the installable for THIS machine's OS into ./dist.
 #
-# One machine can only build its own platform's GUI installer — Mac makes a
+# One machine can only build its own platform's GUI installer - Mac makes a
 # .dmg, Linux makes a .deb + tarball. To get every platform's installer in one
 # place, push a `v*` git tag and let CI (.github/workflows/release.yml) build
 # macOS + Windows + Linux and attach them to the GitHub Release.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-
-mkdir -p dist
+ROOT="$(pwd)"                 # repo root - dist/ lives here
+mkdir -p "$ROOT/dist"
 
 if ! command -v cargo-bundle >/dev/null 2>&1; then
   echo "cargo-bundle not found. Install it with:  cargo install cargo-bundle"
   exit 1
 fi
+
+# The Cargo workspace lives under networking/ (zOrigin category layout). Run all
+# cargo commands from there; target/ is networking/target, dist/ stays at repo root.
+cd "$ROOT/networking"
 
 case "$(uname -s)" in
   Darwin)
@@ -29,7 +33,7 @@ case "$(uname -s)" in
       --target "$ARM" --target "$X86"
 
     # Universal CLI.
-    lipo -create -output dist/zap-macos-cli \
+    lipo -create -output "$ROOT/dist/zap-macos-cli" \
       "target/$X86/release/zap" "target/$ARM/release/zap"
 
     # Bundle the .app, then replace its binary with the universal one.
@@ -43,17 +47,17 @@ case "$(uname -s)" in
     rm -rf "$STAGE"; mkdir -p "$STAGE"
     cp -R "$APP" "$STAGE/"
     ln -s /Applications "$STAGE/Applications"
-    rm -f dist/zap-macos.dmg
-    hdiutil create -volname zap -srcfolder "$STAGE" -ov -format UDZO dist/zap-macos.dmg >/dev/null
+    rm -f "$ROOT/dist/zap-macos.dmg"
+    hdiutil create -volname zap -srcfolder "$STAGE" -ov -format UDZO "$ROOT/dist/zap-macos.dmg" >/dev/null
     echo "✅ dist/zap-macos.dmg (universal)  +  dist/zap-macos-cli (universal)"
-    lipo -info dist/zap-macos-cli
+    lipo -info "$ROOT/dist/zap-macos-cli"
     ;;
   Linux)
     cargo build --release --package zap-cli
     ( cd crates/zap-desktop && cargo bundle --release --format deb )
-    cp target/release/bundle/deb/*.deb dist/
-    cp target/release/zap-desktop dist/zap-linux
-    cp target/release/zap dist/zap-linux-cli
+    cp target/release/bundle/deb/*.deb "$ROOT/dist/"
+    cp target/release/zap-desktop "$ROOT/dist/zap-linux"
+    cp target/release/zap "$ROOT/dist/zap-linux-cli"
     echo "✅ dist/*.deb  +  dist/zap-linux  +  dist/zap-linux-cli"
     ;;
   *)

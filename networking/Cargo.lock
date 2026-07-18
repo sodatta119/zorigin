@@ -4402,7 +4402,7 @@ name = "zap-android"
 version = "0.1.0"
 dependencies = [
  "jni 0.21.1",
- "zap-core",
+ "znet-core",
 ]
 
 [[package]]
@@ -4412,16 +4412,7 @@ dependencies = [
  "anyhow",
  "clap",
  "qrcode",
- "zap-core",
-]
-
-[[package]]
-name = "zap-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "socket2",
- "tiny_http",
+ "znet-core",
 ]
 
 [[package]]
@@ -4433,7 +4424,7 @@ dependencies = [
  "eframe",
  "qrcode",
  "rfd",
- "zap-core",
+ "znet-core",
 ]
 
 [[package]]
@@ -4668,6 +4659,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "znet-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "socket2",
+ "tiny_http",
 ]
 
 [[package]]

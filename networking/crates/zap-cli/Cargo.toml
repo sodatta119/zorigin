@@ -13,4 +13,4 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 qrcode.workspace = true
-zap-core.workspace = true
+znet-core.workspace = true

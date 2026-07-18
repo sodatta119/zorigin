@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use egui::{Color32, FontId, Margin, RichText, Rounding, TextStyle};
 use qrcode::QrCode;
-use zap_core::web::{self, Credentials, Direction, ServeConfig, ServerHandle, ServerInfo, TransferInfo};
+use znet_core::web::{self, Credentials, Direction, ServeConfig, ServerHandle, ServerInfo, TransferInfo};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {

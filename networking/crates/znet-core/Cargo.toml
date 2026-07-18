@@ -1,12 +1,12 @@
 [package]
-name = "zap-core"
+name = "znet-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Core file-transfer logic shared by the zap CLI and the Android app"
+description = "Shared networking engine (LAN web transport) for zOrigin apps: Zap and future networking products"
 
 [lib]
-name = "zap_core"
+name = "znet_core"
 path = "src/lib.rs"
 
 [dependencies]

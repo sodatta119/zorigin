@@ -1,7 +1,7 @@
 //! JNI bridge for the Android app.
 //!
 //! The Android app is a thin Kotlin shell; the actual file-transfer server is
-//! [`zap_core::web`], the same code the desktop CLI runs. On Android the phone
+//! [`znet_core::web`], the same code the desktop CLI runs. On Android the phone
 //! *is* the server, so a foreground service calls these functions to start the
 //! server (bound to all interfaces so devices on the home Wi-Fi can reach it),
 //! query its URL for display, and stop it.
@@ -28,7 +28,7 @@ use jni::objects::{JClass, JString};
 use jni::sys::{jint, jlong, jstring};
 use jni::JNIEnv;
 
-use zap_core::web::{self, Credentials, Direction, ServeConfig, ServerHandle, ServerInfo};
+use znet_core::web::{self, Credentials, Direction, ServeConfig, ServerHandle, ServerInfo};
 
 /// Owns a running server plus its connection details, boxed and handed to Kotlin
 /// as an opaque `jlong` handle.
@@ -174,7 +174,7 @@ pub extern "system" fn Java_com_zap_transfer_NativeBridge_nativeTransfers<'local
     }
 }
 
-fn transfers_json(items: &[zap_core::web::TransferInfo]) -> String {
+fn transfers_json(items: &[znet_core::web::TransferInfo]) -> String {
     let mut s = String::from("[");
     for (i, t) in items.iter().enumerate() {
         if i > 0 {

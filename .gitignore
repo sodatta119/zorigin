@@ -1,9 +1,10 @@
-/target
+# Cargo build output (workspace now lives under networking/, so match at any depth)
+target/
 /dist
 
 # macOS / IDE junk
 .DS_Store
-android/.idea/
+.idea/
 
 # local-only handoff notes
 docs/HANDOFF.md

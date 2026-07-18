@@ -6,8 +6,8 @@ use anyhow::{bail, Result};
 use clap::Parser;
 
 use cli::{Cli, Command, TransportKind};
-use zap_core::transport::{adb::AdbTransport, Transport};
-use zap_core::web::{self, Credentials, ServeConfig, ServerInfo};
+use znet_core::transport::{adb::AdbTransport, Transport};
+use znet_core::web::{self, Credentials, ServeConfig, ServerInfo};
 
 fn main() {
     if let Err(e) = run() {
