@@ -51,6 +51,20 @@ case "$(uname -s)" in
     hdiutil create -volname zap -srcfolder "$STAGE" -ov -format UDZO "$ROOT/dist/zap-macos.dmg" >/dev/null
     echo "✅ dist/zap-macos.dmg (universal)  +  dist/zap-macos-cli (universal)"
     lipo -info "$ROOT/dist/zap-macos-cli"
+
+    # --- Zulu (clipboard sync; desktop app only, no CLI) ---
+    cargo build --release --package zulu-desktop --target "$ARM" --target "$X86"
+    ( cd crates/zulu-desktop && cargo bundle --release )
+    ZAPP=target/release/bundle/osx/Zulu.app
+    lipo -create -output "$ZAPP/Contents/MacOS/zulu-desktop" \
+      "target/$X86/release/zulu-desktop" "target/$ARM/release/zulu-desktop"
+    ZSTAGE=target/zulu-dmg
+    rm -rf "$ZSTAGE"; mkdir -p "$ZSTAGE"
+    cp -R "$ZAPP" "$ZSTAGE/"
+    ln -s /Applications "$ZSTAGE/Applications"
+    rm -f "$ROOT/dist/zulu-macos.dmg"
+    hdiutil create -volname Zulu -srcfolder "$ZSTAGE" -ov -format UDZO "$ROOT/dist/zulu-macos.dmg" >/dev/null
+    echo "✅ dist/zulu-macos.dmg (universal)"
     ;;
   Linux)
     cargo build --release --package zap-cli
@@ -59,6 +73,12 @@ case "$(uname -s)" in
     cp target/release/zap-desktop "$ROOT/dist/zap-linux"
     cp target/release/zap "$ROOT/dist/zap-linux-cli"
     echo "✅ dist/*.deb  +  dist/zap-linux  +  dist/zap-linux-cli"
+
+    # --- Zulu (desktop app only) ---
+    ( cd crates/zulu-desktop && cargo bundle --release --format deb )
+    cp target/release/bundle/deb/zulu*.deb "$ROOT/dist/zulu-linux.deb" 2>/dev/null || true
+    cp target/release/zulu-desktop "$ROOT/dist/zulu-linux"
+    echo "✅ dist/zulu-linux.deb  +  dist/zulu-linux"
     ;;
   *)
     echo "This script builds macOS/Linux. For Windows, run on Windows:"

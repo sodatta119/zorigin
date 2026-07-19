@@ -25,5 +25,6 @@ sha2 = { version = "0.10", optional = true }
 
 [dev-dependencies]
 # The pinning client used by the TLS integration test (independent of
-# tiny_http's internal rustls 0.20; they only exchange PEM/DER bytes).
-rustls = "0.23"
+# tiny_http's internal rustls 0.20; they only exchange PEM/DER bytes). `ring`
+# provider to match the app and build without nasm/cmake.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

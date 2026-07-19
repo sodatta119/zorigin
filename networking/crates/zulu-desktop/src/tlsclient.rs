@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::aws_lc_rs::default_provider;
+use rustls::crypto::ring::default_provider;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, Error as TlsError, SignatureScheme, StreamOwned};
 use sha2::{Digest, Sha256};
@@ -78,7 +78,11 @@ pub fn connect(host: &str, port: u16, fp: Option<&str>, read_timeout: Duration) 
 }
 
 fn pinned_config(fp: &str) -> ClientConfig {
-    ClientConfig::builder()
+    // Pin the provider explicitly (ring) rather than relying on a process-wide
+    // default, so no install_default call is needed.
+    ClientConfig::builder_with_provider(Arc::new(default_provider()))
+        .with_safe_default_protocol_versions()
+        .expect("ring provider supports the default protocol versions")
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(Pinned { pin: fp.to_lowercase() }))
         .with_no_client_auth()

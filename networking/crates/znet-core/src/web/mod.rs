@@ -2483,10 +2483,14 @@ mod tests {
         /// GET /clips over TLS, trusting only the cert whose SHA-256 == `pin`.
         fn tls_get(port: u16, pin: &str) -> Result<String> {
             let verifier = Arc::new(PinnedCert { pin: pin.to_string() });
-            let config = rustls::ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(verifier)
-                .with_no_client_auth();
+            let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
             let server_name = "localhost".try_into().unwrap();
             let mut conn = rustls::ClientConnection::new(Arc::new(config), server_name)?;
             let mut sock = TcpStream::connect(("127.0.0.1", port))?;
@@ -2540,7 +2544,7 @@ mod tests {
                     message,
                     cert,
                     dss,
-                    &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
+                    &rustls::crypto::ring::default_provider().signature_verification_algorithms,
                 )
             }
             fn verify_tls13_signature(
@@ -2553,11 +2557,11 @@ mod tests {
                     message,
                     cert,
                     dss,
-                    &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
+                    &rustls::crypto::ring::default_provider().signature_verification_algorithms,
                 )
             }
             fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-                rustls::crypto::aws_lc_rs::default_provider()
+                rustls::crypto::ring::default_provider()
                     .signature_verification_algorithms
                     .supported_schemes()
             }
