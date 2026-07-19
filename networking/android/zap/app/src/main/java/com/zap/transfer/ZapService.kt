@@ -4,11 +4,14 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Environment
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 
 /**
@@ -21,6 +24,8 @@ import androidx.core.app.NotificationCompat
 class ZapService : Service() {
 
     private var handle: Long = 0L
+    private var wifiLock: WifiManager.WifiLock? = null
+    private var wakeLock: PowerManager.WakeLock? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -46,9 +51,44 @@ class ZapService : Service() {
         handle = NativeBridge.nativeStart(dir, PORT, user, pass, history)
         val url = if (handle != 0L) NativeBridge.nativeUrl(handle) else null
 
+        if (handle != 0L) acquireLocks()
         createChannel()
         startAsForeground(buildNotification(url))
         ZapState.update(url, handle != 0L, handle)
+    }
+
+    /**
+     * Keep the Wi-Fi radio at full power and the CPU awake while serving.
+     *
+     * A foreground service prevents the process from being killed, but it does
+     * NOT stop Android from putting Wi-Fi into power-save (or throttling the CPU)
+     * once the screen turns off - which makes throughput on a phone-hosted server
+     * collapse periodically to ~0. A high-perf WifiLock + a partial WakeLock keep
+     * transfers smooth. Released in [onDestroy].
+     */
+    private fun acquireLocks() {
+        if (wifiLock == null) {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            @Suppress("DEPRECATION") // HIGH_PERF still works and is right for a throughput server
+            wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "zap:wifi").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        }
+        if (wakeLock == null) {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "zap:cpu").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        }
+    }
+
+    private fun releaseLocks() {
+        wifiLock?.let { if (it.isHeld) it.release() }
+        wifiLock = null
+        wakeLock?.let { if (it.isHeld) it.release() }
+        wakeLock = null
     }
 
     private fun startAsForeground(notification: Notification) {
@@ -83,6 +123,7 @@ class ZapService : Service() {
             NativeBridge.nativeStop(handle)
             handle = 0L
         }
+        releaseLocks()
         ZapState.update(null, false, 0L)
         super.onDestroy()
     }

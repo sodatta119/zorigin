@@ -7,6 +7,9 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Keep the CPU awake + Wi-Fi at full power while serving (smooth transfers
+         with the screen off; otherwise throughput periodically drops to ~0). -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!-- Share the whole shared-storage volume. -->
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
