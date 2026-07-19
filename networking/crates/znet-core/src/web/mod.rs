@@ -771,10 +771,38 @@ fn serve_download(request: Request, root: &Path, rel: &str, stats: &Stats) -> Re
     let disposition = format!("attachment; filename=\"{filename}\"");
     let total = meta.len();
 
+    // Validators so a client (Chrome, Safari, curl -C, wget) can *resume* an
+    // interrupted download instead of restarting from 0. On resume the client
+    // sends `Range: bytes=<offset>-` plus `If-Range: <validator>`; without a
+    // validator to echo, Chrome treats the download as non-resumable and starts
+    // over. ETag is strong (bytes are fixed for a given size+mtime).
+    let mtime_nanos = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let etag = format!("\"{total:x}-{mtime_nanos:x}\"");
+    let last_modified = meta.modified().ok().map(http_date);
+
+    // If-Range gates the Range: honor it only when the client's validator still
+    // matches this file; otherwise the file changed under it, so send the whole
+    // thing fresh (200) rather than splicing new bytes onto a stale prefix.
+    let range_allowed = match header_value(&request, "If-Range") {
+        None => true,
+        Some(v) => {
+            let v = v.trim();
+            v == etag || last_modified.as_deref() == Some(v)
+        }
+    };
     // Honor a `Range: bytes=start-[end]` request so downloads can resume and
     // seek. Everything else falls through to a normal 200 that advertises
     // `Accept-Ranges: bytes`.
-    let range = header_value(&request, "Range").and_then(|h| parse_range(h, total));
+    let range = if range_allowed {
+        header_value(&request, "Range").and_then(|h| parse_range(h, total))
+    } else {
+        None
+    };
 
     let transfer = stats.begin(
         &filename,
@@ -798,7 +826,11 @@ fn serve_download(request: Request, root: &Path, rel: &str, stats: &Stats) -> Re
         header("Content-Type", "application/octet-stream"),
         header("Content-Disposition", &disposition),
         header("Accept-Ranges", "bytes"),
+        header("ETag", &etag),
     ];
+    if let Some(lm) = &last_modified {
+        headers.push(header("Last-Modified", lm));
+    }
     if let Some(cr) = &content_range {
         headers.push(header("Content-Range", cr));
     }
@@ -838,6 +870,37 @@ fn parse_range(h: &str, total: u64) -> Option<(u64, u64)> {
         return None;
     }
     Some((start, end))
+}
+
+/// Format a `SystemTime` as an HTTP `Last-Modified` date (RFC 7231 IMF-fixdate,
+/// e.g. `Sun, 06 Nov 1994 08:49:37 GMT`). Dependency-free; uses Howard Hinnant's
+/// civil-from-days algorithm. Pre-1970 times clamp to the epoch.
+fn http_date(t: SystemTime) -> String {
+    let secs = t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let wday = ((days % 7) + 4).rem_euclid(7); // 1970-01-01 was a Thursday (0=Sun)
+
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if m <= 2 { y + 1 } else { y };
+
+    const WD: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MO: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    format!(
+        "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
+        WD[wday as usize], d, MO[(m - 1) as usize], year, hh, mm, ss
+    )
 }
 
 // ---- Folder download (streaming ZIP) ----
@@ -2263,6 +2326,78 @@ mod tests {
 
         handle.stop();
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Read a response header value (case-insensitive) from the raw HTTP text.
+    fn header_from_response(resp: &str, name: &str) -> Option<String> {
+        for line in resp.split("\r\n") {
+            if line.is_empty() {
+                break; // end of header block
+            }
+            if let Some((k, v)) = line.split_once(':') {
+                if k.trim().eq_ignore_ascii_case(name) {
+                    return Some(v.trim().to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// Downloads must carry a strong validator (ETag) + `Accept-Ranges`, and
+    /// honor `If-Range`: a matching validator resumes (206), a stale one restarts
+    /// with the full file (200). This is what lets Chrome resume an interrupted
+    /// download instead of starting over.
+    #[test]
+    fn download_validators_enable_resume() {
+        let _g = port_guard();
+        let dir = std::env::temp_dir().join(format!("zap-validator-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("f.bin"), b"0123456789").unwrap();
+        let (port, handle) = spawn_test_server(&dir);
+
+        // Full GET advertises resume support + a validator.
+        let full = String::from_utf8_lossy(&send_raw(
+            port,
+            "GET /download?path=f.bin HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            b"",
+        ))
+        .into_owned();
+        assert!(full.to_lowercase().contains("accept-ranges: bytes"), "no Accept-Ranges: {full}");
+        let etag = header_from_response(&full, "ETag").expect("ETag header present");
+        assert!(header_from_response(&full, "Last-Modified").is_some(), "Last-Modified present");
+
+        // Range + matching If-Range -> 206 resume from the offset.
+        let ok = String::from_utf8_lossy(&send_raw(
+            port,
+            &format!("GET /download?path=f.bin HTTP/1.1\r\nHost: x\r\nRange: bytes=4-\r\nIf-Range: {etag}\r\nConnection: close\r\n\r\n"),
+            b"",
+        ))
+        .into_owned();
+        assert!(ok.contains(" 206 "), "matching If-Range should resume (206): {ok}");
+        assert!(ok.ends_with("456789"), "should send the tail from offset 4: {ok:?}");
+
+        // Range + stale If-Range -> full 200 (file changed under the client).
+        let stale = String::from_utf8_lossy(&send_raw(
+            port,
+            "GET /download?path=f.bin HTTP/1.1\r\nHost: x\r\nRange: bytes=4-\r\nIf-Range: \"stale\"\r\nConnection: close\r\n\r\n",
+            b"",
+        ))
+        .into_owned();
+        assert!(stale.contains(" 200 "), "stale If-Range should send full 200: {stale}");
+        assert!(!stale.to_lowercase().contains("content-range"), "no Content-Range on a full send: {stale}");
+        assert!(stale.ends_with("0123456789"), "full body: {stale:?}");
+
+        handle.stop();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn http_date_matches_rfc_example() {
+        assert_eq!(http_date(UNIX_EPOCH), "Thu, 01 Jan 1970 00:00:00 GMT");
+        assert_eq!(
+            http_date(UNIX_EPOCH + std::time::Duration::from_secs(784_111_777)),
+            "Sun, 06 Nov 1994 08:49:37 GMT"
+        );
     }
 
     /// End-to-end clip flow: one client holds `GET /events`; a `POST /clip` from
