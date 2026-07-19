@@ -44,10 +44,13 @@ fn theme_bg(dark: bool) -> Color32 {
 }
 
 fn main() -> eframe::Result<()> {
-    let viewport = egui::ViewportBuilder::default()
+    let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([440.0, 620.0])
         .with_min_inner_size([400.0, 520.0])
         .with_title("Zulu");
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon_256.png")) {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native("Zulu", options, Box::new(|_cc| Ok(Box::<ZuluApp>::default())))
 }
@@ -139,6 +142,8 @@ struct ZuluApp {
     error: Option<String>,
     dark: bool,
     shot_frames: u32,
+    /// The Zulu mark texture, lazily loaded from the bundled PNG.
+    mark_tex: Option<egui::TextureHandle>,
     /// Pinned snippets - frequently-pasted text, persisted across runs. Clicking
     /// one puts it back on the clipboard (and syncs it when connected).
     pins: Vec<String>,
@@ -160,6 +165,7 @@ impl Default for ZuluApp {
             error: None,
             dark: std::env::var("ZULU_DARK").is_ok(),
             shot_frames: 0,
+            mark_tex: None,
             pins: load_pins(),
             tried_autohost: false,
         }
@@ -343,17 +349,9 @@ impl ZuluApp {
 
     fn header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            // Painted badge (egui's default font lacks most symbol glyphs, so we
-            // draw the family mark instead of relying on a Unicode icon).
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-            ui.painter().rect_filled(rect, Rounding::same(8.0), ACCENT);
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "z",
-                FontId::proportional(19.0),
-                Color32::from_rgb(0x0A, 0x0F, 0x1A),
-            );
+            // The Zulu origami-giraffe mark.
+            let tex = self.mark_tex.get_or_insert_with(|| load_mark(ui.ctx()));
+            ui.add(egui::Image::new((tex.id(), egui::vec2(34.0, 34.0))));
             ui.add_space(8.0);
             ui.vertical(|ui| {
                 ui.label(RichText::new("Zulu").size(23.0).strong());
@@ -748,6 +746,19 @@ struct SyncSnapshot {
 }
 
 // ---- QR + screenshot (copied from zap-desktop; keep the family harness) ----
+
+/// Decode the bundled Zulu mark PNG into an egui texture (once).
+fn load_mark(ctx: &egui::Context) -> egui::TextureHandle {
+    let color = match image::load_from_memory(include_bytes!("../assets/header_mark.png")) {
+        Ok(img) => {
+            let rgba = img.to_rgba8();
+            let size = [rgba.width() as usize, rgba.height() as usize];
+            egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw())
+        }
+        Err(_) => egui::ColorImage::new([1, 1], Color32::TRANSPARENT),
+    };
+    ctx.load_texture("zulu-mark", color, egui::TextureOptions::LINEAR)
+}
 
 fn qr_texture(ctx: &egui::Context, url: &str) -> Option<egui::TextureHandle> {
     let code = QrCode::new(url.as_bytes()).ok()?;

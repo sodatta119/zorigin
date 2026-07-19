@@ -34,3 +34,4 @@ name = "Zulu"
 identifier = "com.zulu.sync"
 short_description = "Clipboard sync over your local Wi-Fi"
 category = "public.app-category.utilities"
+icon = ["assets/icon.icns", "assets/icon_1024.png"]
