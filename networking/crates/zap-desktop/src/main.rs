@@ -192,6 +192,7 @@ impl ZapApp {
             bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             auth,
             history: history_path(),
+            index_html: None,
         };
         match web::spawn(config) {
             Ok((info, handle)) => {

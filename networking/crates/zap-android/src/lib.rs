@@ -85,6 +85,7 @@ pub extern "system" fn Java_com_zap_transfer_NativeBridge_nativeStart<'local>(
         bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED), // 0.0.0.0 - reachable on the LAN
         auth,
         history: read_opt(&mut env, history).map(PathBuf::from),
+        index_html: None,
     };
 
     match web::spawn(config) {

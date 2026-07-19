@@ -140,7 +140,20 @@ impl EventHub {
     /// `GET /events` response body. Connecting broadcasts a `presence` frame so
     /// every device (including this one) learns the fresh client count.
     pub fn subscribe(&self) -> SseReader {
+        self.subscribe_with_backfill(&[])
+    }
+
+    /// Like [`subscribe`](Self::subscribe), but first queues `initial` events
+    /// for *this client only* - a private backfill (e.g. the recent clips) that
+    /// a freshly-connected device receives before any live frames. The frames
+    /// are enqueued before registration, so they can't interleave with a
+    /// concurrent broadcast and always arrive first.
+    pub fn subscribe_with_backfill(&self, initial: &[Event]) -> SseReader {
         let (tx, rx) = mpsc::channel();
+        // Backfill goes only into this subscriber's own channel.
+        for ev in initial {
+            let _ = tx.send(ev.encode().into_bytes());
+        }
         let (id, count) = {
             let mut hub = self.lock();
             let id = hub.next_id;

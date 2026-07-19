@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>Zulu - clipboard sync</title>
+<style>
+  :root {
+    --bg: #0d0d0f;
+    --card: #17171a;
+    --card2: #1e1e24;
+    --border: #2a2a30;
+    --text: #f2f2f2;
+    --dim: #a6a7b0;
+    --faint: #74757e;
+    --accent: #7fa0d4;
+    --accent-deep: #6f8fc4;
+    --ok: #4fbf88;
+    --ink: #0a0f1a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  body { max-width: 620px; margin: 0 auto; padding: 18px 16px 40px;
+    padding-bottom: max(40px, env(safe-area-inset-bottom)); }
+  .top { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+  .badge { width: 34px; height: 34px; border-radius: 9px; background: var(--accent);
+    display: grid; place-items: center; color: var(--ink); font-weight: 800; font-size: 20px; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: -.01em; }
+  .tag { font-size: 12px; color: var(--faint); margin-top: 1px; }
+  .status { margin-left: auto; text-align: right; font-size: 12px; color: var(--dim); }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+    background: var(--faint); margin-right: 5px; vertical-align: middle; }
+  .dot.on { background: var(--ok); }
+
+  .compose { background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 12px; margin-bottom: 16px; }
+  textarea { width: 100%; min-height: 70px; resize: vertical; background: var(--card2);
+    color: var(--text); border: 1px solid var(--border); border-radius: 9px; padding: 10px;
+    font: inherit; font-size: 15px; }
+  textarea:focus { outline: 2px solid var(--accent-deep); outline-offset: 0; border-color: transparent; }
+  .row { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+  button { font: inherit; font-weight: 650; border: none; border-radius: 9px; cursor: pointer; }
+  .send { background: var(--accent-deep); color: var(--ink); padding: 9px 18px; font-size: 15px; }
+  .send:active { transform: translateY(1px); }
+  .send:disabled { opacity: .5; cursor: default; }
+  .hint { font-size: 12px; color: var(--faint); }
+
+  h2 { font-size: 13px; color: var(--dim); font-weight: 600; margin: 0 0 8px;
+    text-transform: uppercase; letter-spacing: .06em; }
+  ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+  li { background: var(--card); border: 1px solid var(--border); border-radius: 11px;
+    padding: 10px 12px; display: flex; gap: 10px; align-items: flex-start; }
+  .clip-text { flex: 1; min-width: 0; font-size: 14px; line-height: 1.45; word-break: break-word;
+    white-space: pre-wrap; max-height: 7.5em; overflow: hidden; }
+  .clip-text.link { color: var(--accent); }
+  .copy { background: var(--card2); color: var(--text); border: 1px solid var(--border);
+    padding: 6px 12px; font-size: 13px; flex: none; }
+  .copy.copied { background: var(--ok); color: var(--ink); border-color: transparent; }
+  .empty { color: var(--faint); font-size: 13px; background: var(--card); border: 1px dashed var(--border);
+    border-radius: 11px; padding: 14px; }
+  .note { font-size: 12px; color: var(--faint); background: rgba(127,160,212,.10);
+    border-radius: 9px; padding: 10px 12px; margin: 16px 0 0; line-height: 1.5; }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f6f7fa; --card:#fff; --card2:#f1f2f5; --border:#e0e2e8; --text:#1d2026;
+      --dim:#55565f; --faint:#8a8b94; --ink:#fff; }
+    .send, .badge { color: #fff; }
+  }
+</style>
+</head>
+<body>
+  <div class="top">
+    <div class="badge">z</div>
+    <div>
+      <h1>Zulu</h1>
+      <div class="tag">Your clipboard, on every device</div>
+    </div>
+    <div class="status"><span id="dot" class="dot"></span><span id="statusText">Connecting…</span><br>
+      <span id="presence" class="hint"></span></div>
+  </div>
+
+  <div class="compose">
+    <textarea id="input" placeholder="Type or paste here, then Send to share with every device…"></textarea>
+    <div class="row">
+      <button class="send" id="send" disabled>Send</button>
+      <span class="hint" id="sendHint">Copy on a computer running Zulu and it appears below automatically.</span>
+    </div>
+  </div>
+
+  <h2>Recent clips</h2>
+  <ul id="list"></ul>
+  <div class="empty" id="empty">Nothing yet - copy something on a paired device, or send from here.</div>
+
+  <p class="note" id="secureNote"></p>
+
+<script>
+(function () {
+  var list = document.getElementById('list');
+  var empty = document.getElementById('empty');
+  var input = document.getElementById('input');
+  var sendBtn = document.getElementById('send');
+  var dot = document.getElementById('dot');
+  var statusText = document.getElementById('statusText');
+  var presence = document.getElementById('presence');
+  var seen = [];
+
+  function looksLikeLink(t) { return /^https?:\/\/\S+$/i.test(t.trim()); }
+
+  // Copy text to the clipboard. The async Clipboard API needs a secure context
+  // (https or localhost); on a plain-http LAN it's unavailable, so fall back to
+  // a hidden textarea + execCommand, which works on a user gesture.
+  function copyText(text, btn) {
+    var done = function () {
+      btn.classList.add('copied'); var old = btn.textContent; btn.textContent = 'Copied';
+      setTimeout(function () { btn.classList.remove('copied'); btn.textContent = old; }, 1200);
+    };
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(done, function () { legacyCopy(text, done); });
+    } else {
+      legacyCopy(text, done);
+    }
+  }
+  function legacyCopy(text, done) {
+    var ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.focus(); ta.select();
+    try { document.execCommand('copy'); done(); } catch (e) {}
+    document.body.removeChild(ta);
+  }
+
+  function addClip(text) {
+    if (!text) return;
+    empty.style.display = 'none';
+    var li = document.createElement('li');
+    var span = document.createElement('div');
+    span.className = 'clip-text' + (looksLikeLink(text) ? ' link' : '');
+    span.textContent = text;
+    var btn = document.createElement('button');
+    btn.className = 'copy'; btn.textContent = 'Copy';
+    btn.addEventListener('click', function () { copyText(text, btn); });
+    li.appendChild(span); li.appendChild(btn);
+    list.insertBefore(li, list.firstChild);         // newest on top
+    while (list.children.length > 50) list.removeChild(list.lastChild);
+  }
+
+  function setConnected(on) {
+    dot.classList.toggle('on', on);
+    statusText.textContent = on ? 'Connected' : 'Reconnecting…';
+  }
+
+  // Send the compose box as a new clip.
+  function send() {
+    var text = input.value;
+    if (!text) return;
+    sendBtn.disabled = true;
+    fetch('/clip', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: text })
+      .then(function () { input.value = ''; })
+      .catch(function () {})
+      .then(function () { sendBtn.disabled = false; });
+  }
+  sendBtn.addEventListener('click', send);
+  input.addEventListener('input', function () { sendBtn.disabled = input.value.length === 0; });
+  // Cmd/Ctrl+Enter sends.
+  input.addEventListener('keydown', function (e) {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); send(); }
+  });
+
+  // Live stream: named 'clip' and 'presence' events (plus backfill on connect).
+  var es = new EventSource('/events');
+  es.addEventListener('open', function () { setConnected(true); });
+  es.addEventListener('error', function () { setConnected(false); });
+  es.addEventListener('clip', function (e) { addClip(e.data); });
+  es.addEventListener('presence', function (e) {
+    try { var n = JSON.parse(e.data).count; presence.textContent = n + ' device' + (n === 1 ? '' : 's') + ' paired'; } catch (x) {}
+  });
+
+  // Honest note about the browser clipboard limits on this transport.
+  var note = document.getElementById('secureNote');
+  if (!window.isSecureContext) {
+    note.textContent = 'Auto-paste into this browser is blocked without HTTPS, so received clips are one-tap Copy here. On a computer, run the Zulu app for fully automatic sync.';
+  } else {
+    note.textContent = 'Tap Copy on any clip to put it on this device’s clipboard. On a computer, run the Zulu app for fully automatic sync.';
+  }
+})();
+</script>
+</body>
+</html>

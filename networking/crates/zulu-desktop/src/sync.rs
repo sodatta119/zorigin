@@ -15,7 +15,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -56,6 +56,10 @@ struct Shared {
     stop: AtomicBool,
     /// The content we consider already synced (the echo-loop guard).
     last: Mutex<String>,
+    /// Highest clip id applied so far (-1 = none). Skips clips we've already
+    /// seen, so a reconnect's backfill replay isn't re-applied. (Resets only if
+    /// the host restarts and its ids reset - rare; restart Zulu to recover.)
+    seen_id: AtomicI64,
     state: Arc<Mutex<SyncState>>,
 }
 
@@ -107,6 +111,7 @@ impl SyncHandle {
             port,
             stop: AtomicBool::new(false),
             last: Mutex::new(String::new()),
+            seen_id: AtomicI64::new(-1),
             state,
         });
         let receiver = {
@@ -188,6 +193,7 @@ fn stream_events(mut stream: TcpStream, sh: &Arc<Shared>, clip: &mut Option<Clip
     let mut buf: Vec<u8> = Vec::new();
     let mut headers_done = false;
     let mut event: Option<String> = None;
+    let mut id: Option<String> = None;
     let mut data: Vec<String> = Vec::new();
     let mut tmp = [0u8; 4096];
 
@@ -214,7 +220,7 @@ fn stream_events(mut stream: TcpStream, sh: &Arc<Shared>, clip: &mut Option<Clip
             let raw: Vec<u8> = buf.drain(0..=nl).collect();
             let line = String::from_utf8_lossy(&raw[..raw.len() - 1]);
             let line = line.strip_suffix('\r').unwrap_or(&line);
-            on_sse_line(line, &mut event, &mut data, sh, clip);
+            on_sse_line(line, &mut event, &mut id, &mut data, sh, clip);
         }
     }
 }
@@ -223,24 +229,43 @@ fn stream_events(mut stream: TcpStream, sh: &Arc<Shared>, clip: &mut Option<Clip
 fn on_sse_line(
     line: &str,
     event: &mut Option<String>,
+    id: &mut Option<String>,
     data: &mut Vec<String>,
     sh: &Arc<Shared>,
     clip: &mut Option<Clipboard>,
 ) {
     if line.is_empty() {
-        dispatch(event.take(), std::mem::take(data), sh, clip);
+        dispatch(event.take(), id.take(), std::mem::take(data), sh, clip);
     } else if let Some(v) = line.strip_prefix("event:") {
         *event = Some(v.trim().to_string());
+    } else if let Some(v) = line.strip_prefix("id:") {
+        *id = Some(v.trim().to_string());
     } else if let Some(v) = line.strip_prefix("data:") {
         // Exactly one optional leading space is part of the SSE framing.
         data.push(v.strip_prefix(' ').unwrap_or(v).to_string());
     }
-    // ":" comments (heartbeats), "id:", "retry:" need no action here.
+    // ":" comments (heartbeats) and "retry:" need no action here.
 }
 
-fn dispatch(event: Option<String>, data: Vec<String>, sh: &Arc<Shared>, clip: &mut Option<Clipboard>) {
+fn dispatch(
+    event: Option<String>,
+    id: Option<String>,
+    data: Vec<String>,
+    sh: &Arc<Shared>,
+    clip: &mut Option<Clipboard>,
+) {
     match event.as_deref() {
-        Some("clip") => apply_clip(data.join("\n"), sh, clip),
+        Some("clip") => {
+            // Skip clips we've already applied (a reconnect replays the backfill
+            // with the same, non-increasing ids).
+            if let Some(n) = id.as_deref().and_then(|s| s.parse::<i64>().ok()) {
+                if n <= sh.seen_id.load(Ordering::Relaxed) {
+                    return;
+                }
+                sh.seen_id.store(n, Ordering::Relaxed);
+            }
+            apply_clip(data.join("\n"), sh, clip);
+        }
         Some("presence") => {
             if let Some(n) = parse_count(&data.join("")) {
                 if let Ok(mut s) = sh.state.lock() {

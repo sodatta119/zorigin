@@ -53,6 +53,10 @@ pub struct ServeConfig {
     /// on start, so the activity history survives a server stop/start or an app
     /// restart. `None` disables persistence (e.g. the one-shot CLI).
     pub history: Option<PathBuf>,
+    /// The single-page app served at `/`. `None` uses the built-in Zap file
+    /// browser; an app that reuses this server for a different job (e.g. Zulu's
+    /// clipboard receiver) supplies its own page here.
+    pub index_html: Option<String>,
 }
 
 /// Details about a running server, handed to the caller once it is bound and
@@ -377,9 +381,18 @@ pub fn serve(config: ServeConfig, on_ready: impl FnOnce(&ServerInfo)) -> Result<
     let stats = Arc::new(Stats::new(config.history.clone()));
     let hub = EventHub::new();
     let clips = Arc::new(ClipStore::new());
+    let index = index_of(&config);
     // Use the calling thread as the acceptor; blocks until the process exits.
-    accept_loop(&server, &dir, &auth, &stats, &hub, &clips);
+    accept_loop(&server, &dir, &auth, &stats, &hub, &clips, &index);
     Ok(())
+}
+
+/// The SPA to serve at `/`: the app's override if given, else the built-in Zap UI.
+fn index_of(config: &ServeConfig) -> Arc<str> {
+    match &config.index_html {
+        Some(html) => Arc::from(html.as_str()),
+        None => Arc::from(INDEX_HTML),
+    }
 }
 
 /// Bind and start the web server, returning immediately with the connection
@@ -394,6 +407,7 @@ pub fn spawn(config: ServeConfig) -> Result<(ServerInfo, ServerHandle)> {
     let stats = Arc::new(Stats::new(config.history.clone()));
     let hub = EventHub::new();
     let clips = Arc::new(ClipStore::new());
+    let index = index_of(&config);
     let acceptor = {
         let server = Arc::clone(&server);
         let dir = Arc::clone(&dir);
@@ -401,7 +415,8 @@ pub fn spawn(config: ServeConfig) -> Result<(ServerInfo, ServerHandle)> {
         let stats = Arc::clone(&stats);
         let hub = hub.clone();
         let clips = Arc::clone(&clips);
-        thread::spawn(move || accept_loop(&server, &dir, &auth, &stats, &hub, &clips))
+        let index = Arc::clone(&index);
+        thread::spawn(move || accept_loop(&server, &dir, &auth, &stats, &hub, &clips, &index))
     };
     Ok((
         info,
@@ -468,6 +483,7 @@ fn accept_loop(
     stats: &Arc<Stats>,
     hub: &EventHub,
     clips: &Arc<ClipStore>,
+    index: &Arc<str>,
 ) {
     for request in server.incoming_requests() {
         // A request arriving at all proves a client reached this host.
@@ -477,8 +493,9 @@ fn accept_loop(
         let stats = Arc::clone(stats);
         let hub = hub.clone();
         let clips = Arc::clone(clips);
+        let index = Arc::clone(index);
         thread::spawn(move || {
-            if let Err(e) = handle(request, &dir, (*auth).as_ref(), &stats, &hub, &clips) {
+            if let Err(e) = handle(request, &dir, (*auth).as_ref(), &stats, &hub, &clips, &index) {
                 eprintln!("zap: request error: {e:#}");
             }
         });
@@ -492,6 +509,7 @@ fn handle(
     stats: &Arc<Stats>,
     hub: &EventHub,
     clips: &Arc<ClipStore>,
+    index: &str,
 ) -> Result<()> {
     let method = request.method().clone();
     let raw_url = request.url().to_string();
@@ -531,11 +549,11 @@ fn handle(
     }
 
     match (&method, path.as_str()) {
-        (Method::Get, "/") => respond(request, html_response(INDEX_HTML)),
+        (Method::Get, "/") => respond(request, html_response(index)),
         // Live push / presence stream (the family primitive). A client opens it
         // and holds it; the host streams `data:` frames (new clip, presence
         // change) via the `EventHub`. Zap doesn't emit yet; Zulu does.
-        (Method::Get, "/events") => serve_events(request, hub),
+        (Method::Get, "/events") => serve_events(request, hub, clips),
         // Publish a clip: store it and broadcast it to every /events listener.
         // Body is the raw clip text. Zulu's send path.
         (Method::Post, "/clip") => handle_post_clip(request, clips, hub),
@@ -598,8 +616,16 @@ fn handle(
 /// The body has no `Content-Length` and isn't chunked - it's delimited by
 /// connection close, exactly what `text/event-stream` + `EventSource` expect.
 /// `X-Accel-Buffering: no` tells any reverse proxy not to buffer it either.
-fn serve_events(request: Request, hub: &EventHub) -> Result<()> {
-    let mut reader = hub.subscribe();
+fn serve_events(request: Request, hub: &EventHub, clips: &ClipStore) -> Result<()> {
+    // Backfill: a freshly-connected device receives the recent clips (oldest
+    // first) as its first frames, so it lands in sync without a separate fetch
+    // or any client-side JSON parsing. Live frames follow.
+    let backfill: Vec<Event> = clips
+        .recent()
+        .into_iter()
+        .map(|c| Event::named("clip", c.text).with_id(c.id.to_string()))
+        .collect();
+    let mut reader = hub.subscribe_with_backfill(&backfill);
     let mut w = request.into_writer();
     let head = "HTTP/1.1 200 OK\r\n\
         Content-Type: text/event-stream; charset=utf-8\r\n\
@@ -1706,6 +1732,7 @@ mod tests {
             bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
             auth: None,
             history: None,
+            index_html: None,
         };
 
         let (_info, handle) = spawn(make_config()).expect("first bind should succeed");
@@ -1735,6 +1762,7 @@ mod tests {
             bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
             auth: None,
             history: None,
+            index_html: None,
         })
         .expect("bind");
 
@@ -1777,6 +1805,7 @@ mod tests {
             bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
             auth: None,
             history: None,
+            index_html: None,
         })
         .expect("bind");
         (port, handle)
@@ -1840,6 +1869,7 @@ mod tests {
             bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
             auth: None,
             history: Some(histfile.clone()),
+            index_html: None,
         })
         .expect("bind");
 
@@ -2046,6 +2076,7 @@ mod tests {
             bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
             auth: None,
             history: Some(hist.clone()),
+            index_html: None,
         };
 
         let (_i, h) = spawn(cfg()).expect("bind");
@@ -2105,6 +2136,7 @@ mod tests {
             bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
             auth: Some(Credentials { user: "zap".into(), pass: "zap".into() }),
             history: None,
+            index_html: None,
         })
         .expect("bind");
         let token = info.auth_token.clone().expect("secured server exposes a token");
@@ -2232,6 +2264,52 @@ mod tests {
         .into_owned();
         assert!(clips.contains("\"id\":0"), "backfill has the clip: {clips}");
         assert!(clips.contains("line1\\nline2"), "backfill JSON-escapes newlines: {clips}");
+
+        handle.stop();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A device that connects *after* clips were posted still receives them:
+    /// `/events` replays the recent clips as backfill frames before any live
+    /// traffic. This is how a late joiner lands in sync.
+    #[test]
+    fn events_backfills_clips_posted_before_connect() {
+        use std::net::TcpStream;
+        use std::time::{Duration, Instant};
+
+        let _g = port_guard();
+        let dir = std::env::temp_dir().join(format!("zap-backfill-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let (port, handle) = spawn_test_server(&dir);
+
+        // Post a clip while nobody is listening.
+        let _ = send_raw(
+            port,
+            "POST /clip HTTP/1.1\r\nHost: x\r\nContent-Length: 12\r\nConnection: close\r\n\r\nearlier-clip",
+            b"",
+        );
+
+        // Now connect - the clip should arrive as backfill.
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .write_all(b"GET /events HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n")
+            .expect("send");
+        stream.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+
+        let mut buf = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut tmp = [0u8; 1024];
+        while Instant::now() < deadline && !String::from_utf8_lossy(&buf).contains("earlier-clip") {
+            match stream.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {}
+                Err(_) => break,
+            }
+        }
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.contains("event: clip"), "backfill delivers a clip frame: {text}");
+        assert!(text.contains("data: earlier-clip"), "with the earlier clip's text: {text}");
 
         handle.stop();
         let _ = fs::remove_dir_all(&dir);

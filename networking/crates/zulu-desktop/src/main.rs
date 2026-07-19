@@ -16,6 +16,10 @@ use znet_core::web::{self, ServeConfig, ServerHandle, ServerInfo};
 
 use sync::{SyncHandle, SyncState};
 
+/// The browser receiver served at `/` to devices without the native app (any
+/// phone or laptop browser): live clip list + tap-to-copy + a paste-and-send box.
+const ZULU_HTML: &str = include_str!("zulu.html");
+
 const ACCENT: Color32 = Color32::from_rgb(0x7f, 0xa0, 0xd4); // Zulu blue - reads on light & dark
 const ACCENT_BTN: Color32 = Color32::from_rgb(0x6f, 0x8f, 0xc4); // primary button fill
 const WARN: Color32 = Color32::from_rgb(0xC7, 0x3B, 0x2E);
@@ -166,6 +170,7 @@ impl ZuluApp {
                     bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
                     auth: None, // milestone: open on the LAN (encryption is a later phase)
                     history: None,
+                    index_html: Some(ZULU_HTML.to_string()),
                 };
                 match web::spawn(config) {
                     Ok((info, handle)) => {
