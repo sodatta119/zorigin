@@ -193,6 +193,7 @@ impl ZapApp {
             auth,
             history: history_path(),
             index_html: None,
+            tls: None,
         };
         match web::spawn(config) {
             Ok((info, handle)) => {

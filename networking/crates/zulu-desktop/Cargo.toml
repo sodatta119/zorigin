@@ -10,11 +10,15 @@ name = "zulu-desktop"
 path = "src/main.rs"
 
 [dependencies]
-znet-core.workspace = true
+# `tls` enables optional native<->native encryption (self-signed HTTPS host).
+znet-core = { workspace = true, features = ["tls"] }
 anyhow.workspace = true
 qrcode.workspace = true
 eframe = "0.29"
 dirs = "5"
+# TLS client with fingerprint pinning (the join side of encrypted sync).
+rustls = "0.23"
+sha2 = "0.10"
 # Cross-platform OS clipboard read/write. Reading the clipboard is not in std;
 # egui can only read via paste events, so Zulu needs a real clipboard crate to
 # poll for local copies on desktop.

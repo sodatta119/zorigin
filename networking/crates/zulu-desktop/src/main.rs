@@ -5,6 +5,7 @@
 
 mod imageclip;
 mod sync;
+mod tlsclient;
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
@@ -13,7 +14,7 @@ use std::time::Duration;
 use eframe::egui;
 use egui::{Color32, FontId, Margin, RichText, Rounding, TextStyle};
 use qrcode::QrCode;
-use znet_core::web::{self, ServeConfig, ServerHandle, ServerInfo};
+use znet_core::web::{self, ServeConfig, ServerHandle, ServerInfo, TlsMaterial};
 
 use sync::{SyncHandle, SyncState};
 
@@ -127,6 +128,11 @@ struct ZuluApp {
     mode: Mode,
     port: u16,
     peer_url: String,
+    /// Host mode: encrypt the LAN hop with a self-signed cert (native peers pin
+    /// its fingerprint; the browser receiver only works plaintext).
+    secure: bool,
+    /// The generated cert while hosting securely (None = plain HTTP).
+    tls_material: Option<TlsMaterial>,
     hosting: Option<Hosting>,
     sync: Option<SyncHandle>,
     state: Arc<Mutex<SyncState>>,
@@ -146,6 +152,8 @@ impl Default for ZuluApp {
             mode: Mode::Host,
             port: 8080,
             peer_url: String::new(),
+            secure: false,
+            tls_material: None,
             hosting: None,
             sync: None,
             state: Arc::new(Mutex::new(SyncState::default())),
@@ -169,18 +177,38 @@ impl ZuluApp {
 
         let base = match self.mode {
             Mode::Host => {
+                // Generate a fresh self-signed cert when hosting securely.
+                self.tls_material = if self.secure {
+                    match web::tls::self_signed(host_sans()) {
+                        Ok(m) => Some(m),
+                        Err(e) => {
+                            self.error = Some(format!("Encryption setup failed: {e:#}"));
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
                 let config = ServeConfig {
                     dir: clip_dir(),
                     port: self.port,
                     bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                    auth: None, // milestone: open on the LAN (encryption is a later phase)
+                    auth: None, // open on the LAN; encryption is the `secure` toggle
                     history: None,
                     index_html: Some(ZULU_HTML.to_string()),
+                    tls: self.tls_material.clone(),
                 };
                 match web::spawn(config) {
                     Ok((info, handle)) => {
-                        let qr = qr_texture(ctx, &info.url());
-                        let base = format!("127.0.0.1:{}", info.port);
+                        // The QR/URL carries the scheme + cert fingerprint so a
+                        // native peer pins it automatically.
+                        let qr = qr_texture(ctx, &info.url_with_key());
+                        // The host's own client talks to itself over loopback,
+                        // matching the server's scheme (and pinning its cert).
+                        let base = match &self.tls_material {
+                            Some(m) => format!("https://127.0.0.1:{}?fp={}", info.port, m.fingerprint),
+                            None => format!("127.0.0.1:{}", info.port),
+                        };
                         self.hosting = Some(Hosting { info, _handle: handle, qr });
                         base
                     }
@@ -214,6 +242,7 @@ impl ZuluApp {
             h.stop();
         }
         self.hosting = None; // dropping the ServerHandle stops the server
+        self.tls_material = None;
     }
 }
 
@@ -230,6 +259,7 @@ impl eframe::App for ZuluApp {
         // driven headlessly without clicking the button.
         if !self.tried_autohost && std::env::var("ZULU_AUTOHOST").is_ok() {
             self.tried_autohost = true;
+            self.secure = std::env::var("ZULU_SECURE").is_ok();
             self.start(ctx);
         }
 
@@ -366,6 +396,15 @@ impl ZuluApp {
                             }
                         }
                     });
+                    ui.add_space(6.0);
+                    ui.checkbox(&mut self.secure, "Encrypt the connection (TLS)");
+                    if self.secure {
+                        ui.label(
+                            RichText::new("Native devices only: each pins the host's certificate from the QR/URL. The browser receiver can't open an encrypted host without a warning.")
+                                .size(11.5)
+                                .weak(),
+                        );
+                    }
                 });
             }
             Mode::Join => {
@@ -411,9 +450,18 @@ impl ZuluApp {
 
         // Host: show how others join.
         if let Some(h) = &self.hosting {
+            let encrypted = self.tls_material.is_some();
             card(ui, self.dark, |ui| {
                 ui.label(RichText::new("Others join at").size(12.5).weak());
-                ui.label(RichText::new(h.info.url()).monospace().color(ACCENT).size(15.0));
+                if encrypted {
+                    // The fingerprint must travel too, so show the full keyed URL
+                    // (also in the QR) and flag that it's encrypted.
+                    ui.label(RichText::new(h.info.url()).monospace().color(ACCENT).size(15.0));
+                    ui.label(RichText::new("Encrypted - scan the QR (or paste the full link) so the device pins this host's certificate:").size(11.0).color(OK));
+                    ui.label(RichText::new(h.info.url_with_key()).monospace().size(10.5).weak());
+                } else {
+                    ui.label(RichText::new(h.info.url()).monospace().color(ACCENT).size(15.0));
+                }
                 if let Some(qr) = &h.qr {
                     ui.add_space(8.0);
                     ui.vertical_centered(|ui| {
@@ -666,6 +714,16 @@ fn truncate(s: &str, max: usize) -> String {
         out.push('…');
         out
     }
+}
+
+/// Subject-alternative names for the self-signed host cert: the LAN IP plus the
+/// loopback names the host's own client uses.
+fn host_sans() -> Vec<String> {
+    let mut sans = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+    if let Some(ip) = web::lan_ip() {
+        sans.insert(0, ip.to_string());
+    }
+    sans
 }
 
 /// Where the host's znet-core server keeps its (unused, for Zulu) share dir.

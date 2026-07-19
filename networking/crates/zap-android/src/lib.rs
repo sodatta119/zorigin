@@ -86,6 +86,7 @@ pub extern "system" fn Java_com_zap_transfer_NativeBridge_nativeStart<'local>(
         auth,
         history: read_opt(&mut env, history).map(PathBuf::from),
         index_html: None,
+        tls: None,
     };
 
     match web::spawn(config) {

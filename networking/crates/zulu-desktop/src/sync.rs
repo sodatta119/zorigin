@@ -14,13 +14,14 @@
 //! the host broadcasts back to us) is never re-applied.
 
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
+
+use crate::tlsclient::{self, Conn};
 
 const POLL: Duration = Duration::from_millis(500);
 const READ_TIMEOUT: Duration = Duration::from_millis(500);
@@ -53,6 +54,8 @@ pub struct ClipLine {
 struct Shared {
     host: String,
     port: u16,
+    /// When Some, connect over TLS pinning this cert fingerprint.
+    tls_fp: Option<String>,
     stop: AtomicBool,
     /// The content we consider already synced (the echo-loop guard).
     last: Mutex<String>,
@@ -109,10 +112,11 @@ impl SyncHandle {
     /// Start syncing against `base` (e.g. `http://192.168.1.9:8080`, or just
     /// `192.168.1.9:8080`). Returns `None` if the address can't be parsed.
     pub fn start(base: &str, state: Arc<Mutex<SyncState>>) -> Option<SyncHandle> {
-        let (host, port) = parse_base(base)?;
+        let (host, port, tls_fp) = parse_base(base)?;
         let shared = Arc::new(Shared {
             host,
             port,
+            tls_fp,
             stop: AtomicBool::new(false),
             last: Mutex::new(String::new()),
             seen_id: AtomicI64::new(-1),
@@ -138,20 +142,31 @@ impl SyncHandle {
     }
 }
 
-/// Parse `http://host:port/...` (scheme, path and query optional) into
-/// `(host, port)`. Defaults to port 8080 when none is given.
-fn parse_base(url: &str) -> Option<(String, u16)> {
+/// Parse `http(s)://host:port/...?fp=<hex>` into `(host, port, tls_fingerprint)`.
+/// `https` selects TLS and the `fp` query param is the pinned cert fingerprint;
+/// plain `http` ignores any `fp`. Scheme, path and query are all optional; port
+/// defaults to 8080.
+fn parse_base(url: &str) -> Option<(String, u16, Option<String>)> {
     let s = url.trim();
-    let s = s.strip_prefix("http://").unwrap_or(s);
-    let s = s.strip_prefix("https://").unwrap_or(s);
+    let https = s.starts_with("https://");
+    let s = s
+        .strip_prefix("http://")
+        .or_else(|| s.strip_prefix("https://"))
+        .unwrap_or(s);
     let authority = s.split(['/', '?']).next().unwrap_or(s);
     if authority.is_empty() {
         return None;
     }
-    match authority.rsplit_once(':') {
-        Some((host, port)) => Some((host.to_string(), port.parse().ok()?)),
-        None => Some((authority.to_string(), 8080)),
-    }
+    let query = s.split_once('?').map(|(_, q)| q);
+    let fp = query.and_then(|q| {
+        q.split('&').find_map(|kv| kv.strip_prefix("fp=")).map(|v| v.to_string())
+    });
+    let tls_fp = if https { Some(fp.unwrap_or_default()) } else { None };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse().ok()?),
+        None => (authority.to_string(), 8080),
+    };
+    Some((host, port, tls_fp))
 }
 
 // ---- receiver: hold GET /events, apply incoming clips ----
@@ -161,7 +176,7 @@ fn run_receiver(sh: Arc<Shared>) {
     // one, we can still show activity; we just can't auto-paste.
     let mut clip = Clipboard::new().ok();
     while !sh.stopped() {
-        match open_events(&sh.host, sh.port) {
+        match open_events(&sh) {
             Ok(stream) => {
                 sh.set_connected(true);
                 sh.set_error(None);
@@ -179,13 +194,12 @@ fn run_receiver(sh: Arc<Shared>) {
     }
 }
 
-fn open_events(host: &str, port: u16) -> io::Result<TcpStream> {
-    let stream = TcpStream::connect((host, port))?;
-    stream.set_read_timeout(Some(READ_TIMEOUT))?;
-    let mut s = stream;
+fn open_events(sh: &Arc<Shared>) -> io::Result<Conn> {
+    let mut s = tlsclient::connect(&sh.host, sh.port, sh.tls_fp.as_deref(), READ_TIMEOUT)?;
     write!(
         s,
-        "GET /events HTTP/1.1\r\nHost: {host}\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n\r\n"
+        "GET /events HTTP/1.1\r\nHost: {}\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n\r\n",
+        sh.host
     )?;
     s.flush()?;
     Ok(s)
@@ -194,7 +208,7 @@ fn open_events(host: &str, port: u16) -> io::Result<TcpStream> {
 /// Read the SSE stream, dispatching `clip` and `presence` events until the
 /// connection drops or we're told to stop. Timeouts are expected (they let us
 /// check the stop flag), so they don't end the loop.
-fn stream_events(mut stream: TcpStream, sh: &Arc<Shared>, clip: &mut Option<Clipboard>) {
+fn stream_events(mut stream: Conn, sh: &Arc<Shared>, clip: &mut Option<Clipboard>) {
     let mut buf: Vec<u8> = Vec::new();
     let mut headers_done = false;
     let mut event: Option<String> = None;
@@ -376,7 +390,7 @@ fn run_sender(sh: Arc<Shared>) {
             }
             *guard = cur.clone();
         }
-        match post_clip(&sh.host, sh.port, &cur) {
+        match post_clip(&sh, &cur) {
             Ok(()) => sh.record(label(&cur), false),
             Err(e) => sh.set_error(Some(format!("Send failed: {e}"))),
         }
@@ -395,17 +409,18 @@ fn read_clipboard(clip: &mut Clipboard) -> Option<String> {
     crate::imageclip::read_image_data_url(clip)
 }
 
-fn post_clip(host: &str, port: u16, text: &str) -> io::Result<()> {
-    let mut s = TcpStream::connect((host, port))?;
-    s.set_read_timeout(Some(Duration::from_secs(3)))?;
+fn post_clip(sh: &Arc<Shared>, text: &str) -> io::Result<()> {
+    let mut s = tlsclient::connect(&sh.host, sh.port, sh.tls_fp.as_deref(), Duration::from_secs(3))?;
     write!(
         s,
-        "POST /clip HTTP/1.1\r\nHost: {host}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST /clip HTTP/1.1\r\nHost: {}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        sh.host,
         text.len()
     )?;
     s.write_all(text.as_bytes())?;
     s.flush()?;
-    // Drain and discard the response so the server sees a clean close.
+    // Drain and discard the response so the server sees a clean close. Over TLS
+    // a `Connection: close` shows up as UnexpectedEof after the body - fine.
     let mut resp = Vec::new();
     let _ = s.read_to_end(&mut resp);
     Ok(())
@@ -444,11 +459,24 @@ mod tests {
 
     #[test]
     fn parse_base_handles_forms() {
-        assert_eq!(parse_base("http://192.168.1.9:8080"), Some(("192.168.1.9".into(), 8080)));
-        assert_eq!(parse_base("192.168.1.9:8080/"), Some(("192.168.1.9".into(), 8080)));
-        assert_eq!(parse_base("http://host:9000/path?k=abc"), Some(("host".into(), 9000)));
-        assert_eq!(parse_base("10.0.0.2"), Some(("10.0.0.2".into(), 8080)));
+        assert_eq!(parse_base("http://192.168.1.9:8080"), Some(("192.168.1.9".into(), 8080, None)));
+        assert_eq!(parse_base("192.168.1.9:8080/"), Some(("192.168.1.9".into(), 8080, None)));
+        assert_eq!(parse_base("http://host:9000/path?k=abc"), Some(("host".into(), 9000, None)));
+        assert_eq!(parse_base("10.0.0.2"), Some(("10.0.0.2".into(), 8080, None)));
         assert_eq!(parse_base(""), None);
+    }
+
+    #[test]
+    fn parse_base_extracts_tls_fingerprint() {
+        // https selects TLS and pulls the pinned fingerprint from `fp`.
+        assert_eq!(
+            parse_base("https://192.168.1.9:8080/?k=tok&fp=abcd1234"),
+            Some(("192.168.1.9".into(), 8080, Some("abcd1234".into())))
+        );
+        // https without fp still means TLS (empty pin -> will fail to verify).
+        assert_eq!(parse_base("https://host:9000"), Some(("host".into(), 9000, Some(String::new()))));
+        // plain http ignores any fp.
+        assert_eq!(parse_base("http://host:9000?fp=xx"), Some(("host".into(), 9000, None)));
     }
 
     #[test]

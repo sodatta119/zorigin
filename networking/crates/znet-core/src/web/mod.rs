@@ -29,6 +29,22 @@ mod events;
 pub use clips::{Clip, ClipStore};
 pub use events::{Event, EventHub};
 
+#[cfg(feature = "tls")]
+pub mod tls;
+
+/// Self-signed TLS material for optional encryption (see [`ServeConfig::tls`]).
+/// Plain data (PEM bytes + fingerprint), so it exists regardless of the `tls`
+/// feature; generating it ([`tls::self_signed`]) needs the feature.
+#[derive(Clone)]
+pub struct TlsMaterial {
+    /// PEM-encoded certificate chain.
+    pub cert_pem: Vec<u8>,
+    /// PEM-encoded private key.
+    pub key_pem: Vec<u8>,
+    /// Lowercase hex SHA-256 of the DER cert - what a client pins to trust it.
+    pub fingerprint: String,
+}
+
 const INDEX_HTML: &str = include_str!("index.html");
 const LOGIN_HTML: &str = include_str!("login.html");
 
@@ -57,6 +73,10 @@ pub struct ServeConfig {
     /// browser; an app that reuses this server for a different job (e.g. Zulu's
     /// clipboard receiver) supplies its own page here.
     pub index_html: Option<String>,
+    /// If set, the server speaks **HTTPS** with this self-signed cert (requires
+    /// the `tls` feature). Clients pin the [`fingerprint`](TlsMaterial::fingerprint).
+    /// `None` = plain HTTP (the default; keeps the browser receiver working).
+    pub tls: Option<TlsMaterial>,
 }
 
 /// Details about a running server, handed to the caller once it is bound and
@@ -74,26 +94,41 @@ pub struct ServerInfo {
     /// carrying `?k=<key>` auto-authenticates, so scanning the QR skips the
     /// password. `None` when the server is open (no auth).
     pub auth_token: Option<String>,
+    /// When TLS is on, the cert's SHA-256 fingerprint (hex). The URL then uses
+    /// `https://` and carries `&fp=<hex>` so a native client can pin it. `None`
+    /// = plain HTTP.
+    pub tls_fingerprint: Option<String>,
 }
 
 impl ServerInfo {
     /// The URL another device on the same network should open. Falls back to
-    /// `localhost` when no LAN IP could be determined.
+    /// `localhost` when no LAN IP could be determined. Uses `https://` when TLS
+    /// is enabled.
     pub fn url(&self) -> String {
         let host = self
             .lan_ip
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| "localhost".to_string());
-        format!("http://{host}:{}/", self.port)
+        let scheme = if self.tls_fingerprint.is_some() { "https" } else { "http" };
+        format!("{scheme}://{host}:{}/", self.port)
     }
 
     /// The URL to encode in a QR / share link: like [`url`](Self::url) but with
-    /// the pairing key appended when the server is secured, so scanning it grants
-    /// access without typing the password. Identical to `url()` when open.
+    /// the pairing key and (under TLS) the cert fingerprint appended, so opening
+    /// it grants access and pins the cert without any typing. Identical to
+    /// `url()` when open and plaintext.
     pub fn url_with_key(&self) -> String {
-        match &self.auth_token {
-            Some(token) => format!("{}?k={token}", self.url()),
-            None => self.url(),
+        let mut params: Vec<String> = Vec::new();
+        if let Some(token) = &self.auth_token {
+            params.push(format!("k={token}"));
+        }
+        if let Some(fp) = &self.tls_fingerprint {
+            params.push(format!("fp={fp}"));
+        }
+        if params.is_empty() {
+            self.url()
+        } else {
+            format!("{}?{}", self.url(), params.join("&"))
         }
     }
 }
@@ -441,7 +476,10 @@ fn bind(config: &ServeConfig) -> Result<(Arc<Server>, Arc<PathBuf>, ServerInfo)>
     let addr = SocketAddr::new(config.bind, config.port);
     let listener = bind_listener(addr)
         .with_context(|| format!("failed to start server on {addr}"))?;
-    let server = Server::from_listener(listener, None)
+    // Keep our socket2-tuned listener (SO_REUSEADDR + buffers); layer TLS on top
+    // when requested. `from_listener` takes the same `Option<SslConfig>` either way.
+    let ssl = build_ssl(config)?;
+    let server = Server::from_listener(listener, ssl)
         .map_err(|e| anyhow::anyhow!("failed to start server on {addr}: {e}"))?;
 
     let dir = Arc::new(dir);
@@ -450,8 +488,28 @@ fn bind(config: &ServeConfig) -> Result<(Arc<Server>, Arc<PathBuf>, ServerInfo)>
         port: config.port,
         lan_ip: lan_ip(),
         auth_token: None, // filled in by serve/spawn once auth is built
+        tls_fingerprint: config.tls.as_ref().map(|t| t.fingerprint.clone()),
     };
     Ok((Arc::new(server), dir, info))
+}
+
+/// Build the tiny_http SSL config from [`ServeConfig::tls`]. Only the `tls`
+/// build can actually serve HTTPS; without the feature, asking for TLS is a
+/// hard error rather than a silent downgrade to plaintext.
+#[cfg(feature = "tls")]
+fn build_ssl(config: &ServeConfig) -> Result<Option<tiny_http::SslConfig>> {
+    Ok(config.tls.as_ref().map(|t| tiny_http::SslConfig {
+        certificate: t.cert_pem.clone(),
+        private_key: t.key_pem.clone(),
+    }))
+}
+
+#[cfg(not(feature = "tls"))]
+fn build_ssl(config: &ServeConfig) -> Result<Option<tiny_http::SslConfig>> {
+    if config.tls.is_some() {
+        anyhow::bail!("TLS was requested but znet-core was built without the `tls` feature");
+    }
+    Ok(None)
 }
 
 /// Create the listening socket with `SO_REUSEADDR` set *before* bind, then start
@@ -1733,6 +1791,7 @@ mod tests {
             auth: None,
             history: None,
             index_html: None,
+            tls: None,
         };
 
         let (_info, handle) = spawn(make_config()).expect("first bind should succeed");
@@ -1763,6 +1822,7 @@ mod tests {
             auth: None,
             history: None,
             index_html: None,
+            tls: None,
         })
         .expect("bind");
 
@@ -1806,6 +1866,7 @@ mod tests {
             auth: None,
             history: None,
             index_html: None,
+            tls: None,
         })
         .expect("bind");
         (port, handle)
@@ -1870,6 +1931,7 @@ mod tests {
             auth: None,
             history: Some(histfile.clone()),
             index_html: None,
+            tls: None,
         })
         .expect("bind");
 
@@ -2077,6 +2139,7 @@ mod tests {
             auth: None,
             history: Some(hist.clone()),
             index_html: None,
+            tls: None,
         };
 
         let (_i, h) = spawn(cfg()).expect("bind");
@@ -2137,6 +2200,7 @@ mod tests {
             auth: Some(Credentials { user: "zap".into(), pass: "zap".into() }),
             history: None,
             index_html: None,
+            tls: None,
         })
         .expect("bind");
         let token = info.auth_token.clone().expect("secured server exposes a token");
@@ -2371,5 +2435,132 @@ mod tests {
 
         handle.stop();
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- TLS: self-signed HTTPS + fingerprint pinning (feature `tls`) ----
+
+    /// End-to-end encryption: a server with a generated self-signed cert speaks
+    /// HTTPS; a client that pins the cert's fingerprint connects and gets a real
+    /// response, while a client pinning the *wrong* fingerprint is refused. This
+    /// is the native<->native trust primitive - no CA, just a fingerprint read
+    /// off the pairing link.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_server_accepts_pinned_client_and_rejects_wrong_fingerprint() {
+        use std::net::TcpStream;
+        use std::sync::Arc;
+
+        let _g = port_guard();
+        let dir = std::env::temp_dir().join(format!("zap-tls-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let material = tls::self_signed(vec!["localhost".into(), "127.0.0.1".into()]).expect("cert");
+        let good_fp = material.fingerprint.clone();
+        let port = free_port();
+        let (_info, handle) = spawn(ServeConfig {
+            dir: dir.clone(),
+            port,
+            bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            auth: None,
+            history: None,
+            index_html: None,
+            tls: Some(material),
+        })
+        .expect("bind https");
+
+        // A client pinning the correct fingerprint completes the handshake and
+        // gets a 200 back over TLS.
+        let resp = tls_get(port, &good_fp).expect("pinned client should connect");
+        assert!(resp.contains("200"), "encrypted request should succeed: {resp}");
+
+        // A client pinning a different fingerprint must fail the handshake.
+        let bad = tls_get(port, &"00".repeat(32));
+        assert!(bad.is_err(), "wrong fingerprint must be rejected");
+
+        handle.stop();
+        let _ = fs::remove_dir_all(&dir);
+
+        /// GET /clips over TLS, trusting only the cert whose SHA-256 == `pin`.
+        fn tls_get(port: u16, pin: &str) -> Result<String> {
+            let verifier = Arc::new(PinnedCert { pin: pin.to_string() });
+            let config = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(verifier)
+                .with_no_client_auth();
+            let server_name = "localhost".try_into().unwrap();
+            let mut conn = rustls::ClientConnection::new(Arc::new(config), server_name)?;
+            let mut sock = TcpStream::connect(("127.0.0.1", port))?;
+            let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+            // A rejected handshake surfaces on the first write/read - exactly
+            // what we want the "wrong fingerprint" case to hit.
+            tls.write_all(b"GET /clips HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                match tls.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    // tiny_http closes the socket without a TLS close_notify on
+                    // `Connection: close`; the bytes before it are the real
+                    // response, so treat this one case as a clean EOF.
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Ok(String::from_utf8_lossy(&buf).into_owned())
+        }
+
+        /// A rustls verifier that trusts a cert solely by its SHA-256 fingerprint.
+        #[derive(Debug)]
+        struct PinnedCert {
+            pin: String,
+        }
+        impl rustls::client::danger::ServerCertVerifier for PinnedCert {
+            fn verify_server_cert(
+                &self,
+                end_entity: &rustls::pki_types::CertificateDer<'_>,
+                _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+                _server_name: &rustls::pki_types::ServerName<'_>,
+                _ocsp: &[u8],
+                _now: rustls::pki_types::UnixTime,
+            ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+                if tls::fingerprint_hex(end_entity) == self.pin {
+                    Ok(rustls::client::danger::ServerCertVerified::assertion())
+                } else {
+                    Err(rustls::Error::General("fingerprint mismatch".into()))
+                }
+            }
+            fn verify_tls12_signature(
+                &self,
+                message: &[u8],
+                cert: &rustls::pki_types::CertificateDer<'_>,
+                dss: &rustls::DigitallySignedStruct,
+            ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+                rustls::crypto::verify_tls12_signature(
+                    message,
+                    cert,
+                    dss,
+                    &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
+                )
+            }
+            fn verify_tls13_signature(
+                &self,
+                message: &[u8],
+                cert: &rustls::pki_types::CertificateDer<'_>,
+                dss: &rustls::DigitallySignedStruct,
+            ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+                rustls::crypto::verify_tls13_signature(
+                    message,
+                    cert,
+                    dss,
+                    &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
+                )
+            }
+            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+                rustls::crypto::aws_lc_rs::default_provider()
+                    .signature_verification_algorithms
+                    .supported_schemes()
+            }
+        }
     }
 }

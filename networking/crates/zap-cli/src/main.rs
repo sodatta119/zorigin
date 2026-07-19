@@ -47,6 +47,7 @@ fn run() -> Result<()> {
                     auth,
                     history: None, // one-shot CLI: no persistent history
                     index_html: None,
+                    tls: None,
                 },
                 |info| {
                     print_banner(info);
