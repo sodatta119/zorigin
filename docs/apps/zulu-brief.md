@@ -199,11 +199,24 @@ appears on B, auto-pasted. ✅ **Shipped and verified.**
 - **Pinned snippets** - pin any recent clip; pins persist to
   `<app-data>/zulu/pins.txt` (newline-escaped) and reappear next run. Clicking a
   pin puts it back on the clipboard (and syncs it when connected).
+- **Native Android app** (`networking/android/zulu`) - a lean, pure-Kotlin
+  client (no JNI): a system **share-sheet target** ("Send to Zulu" POSTs shared
+  text/links to the paired host's `/clip`) plus a pairing screen that opens the
+  web receiver for tap-to-copy. Builds to an APK with the existing gradle setup.
+- **End-to-end encryption** (opt-in, `znet-core` feature `tls`) - a "Encrypt
+  (TLS)" host toggle generates a self-signed cert (`rcgen`), serves HTTPS, and
+  puts the cert's SHA-256 **fingerprint** in the QR/URL (`&fp=`). Native peers
+  pin it (`rustls`, `ring` provider); plain HTTP stays the default so the
+  browser receiver keeps working. Verified: HTTPS-only server + a pinning client
+  round-trip a clip; a wrong fingerprint is refused.
+- **Distribution** - `scripts/build-dist.sh` builds a universal Zulu `.dmg`
+  (macOS) and `.deb` (Linux); `.github/workflows/release.yml` builds
+  Zap+Zulu `.dmg`/`.zip`/`.deb` and a Zulu `.apk` as release assets on a `v*`
+  tag. (dmg + apk verified locally; Windows/Linux come from CI.)
 
-**Next:** a **native Android app** (share-target sender + tap-to-copy) - the web
-receiver already covers Android *browsers*, but a true system share-sheet needs
-either TLS (for a PWA Web Share Target - service workers require a secure
-context) or a Kotlin shell. Then end-to-end **encryption** (`rustls`, H1.5).
+**Next (open):** Play Store release (signed AAB, data-safety form - a Zap H0
+item); TLS for the *browser* receiver (needs a trusted cert story, not
+self-signed); iOS (very limited - document the gap).
 
 > Run it: `cargo run -p zulu-desktop` on two machines on the same Wi-Fi - one
 > Host, one Join with the shown URL. Any phone/laptop **browser** can also open

@@ -24,7 +24,7 @@ zOrigin
 | Product | Category | What it does | Status |
 | --- | --- | --- | --- |
 | **Zap** | networking | Cross-platform file & folder transfer over local Wi-Fi - the receiver just opens a link in a browser, no app needed | ✅ Live |
-| **Zulu** | networking | Clipboard & link sync - copy on one device, it's instantly on your others | 🚧 Desktop MVP (desktop↔desktop text sync working) |
+| **Zulu** | networking | Clipboard & link sync - copy on one device, it's instantly on your others | 🚧 In progress (desktop app, Android app, no-app web receiver, small images, pinned snippets, opt-in TLS) |
 | **Zeus** | networking | Wake & power control - turn your PCs on and off from your phone | Planned |
 | **Zod** | networking | LAN recon - see and inspect everything on your Wi-Fi | Planned |
 | **Zeta** | networking | Phone as a trackpad for your computer | Planned |
