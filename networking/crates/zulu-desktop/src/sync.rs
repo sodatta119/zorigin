@@ -18,7 +18,7 @@ use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
 
@@ -60,6 +60,10 @@ struct Shared {
     /// seen, so a reconnect's backfill replay isn't re-applied. (Resets only if
     /// the host restarts and its ids reset - rare; restart Zulu to recover.)
     seen_id: AtomicI64,
+    /// Until this instant, the sender skips the clipboard - set briefly after we
+    /// apply a received image, because the OS can hand an image back in a
+    /// slightly different encoding and we don't want to echo that back.
+    mute_until: Mutex<Instant>,
     state: Arc<Mutex<SyncState>>,
 }
 
@@ -112,6 +116,7 @@ impl SyncHandle {
             stop: AtomicBool::new(false),
             last: Mutex::new(String::new()),
             seen_id: AtomicI64::new(-1),
+            mute_until: Mutex::new(Instant::now()),
             state,
         });
         let receiver = {
@@ -294,9 +299,37 @@ fn apply_clip(text: String, sh: &Arc<Shared>, clip: &mut Option<Clipboard>) {
         *guard = text.clone();
     }
     if let Some(c) = clip {
-        let _ = c.set_text(text.clone());
+        if crate::imageclip::is_image(&text) {
+            if crate::imageclip::apply_image_data_url(c, &text) {
+                // Mute the sender briefly so it can't read this image back and
+                // re-post it before we canonicalize the guard below.
+                if let Ok(mut m) = sh.mute_until.lock() {
+                    *m = Instant::now() + Duration::from_millis(900);
+                }
+                // The OS may hand an image back in a slightly different encoding
+                // than we sent. Canonicalize the guard to what THIS device will
+                // now read, so the sender doesn't mistake it for a fresh copy.
+                if let Some(canon) = crate::imageclip::read_image_data_url(c) {
+                    if let Ok(mut g) = sh.last.lock() {
+                        *g = canon;
+                    }
+                }
+            }
+        } else {
+            let _ = c.set_text(text.clone());
+        }
     }
-    sh.record(&text, true);
+    sh.record(label(&text), true);
+}
+
+/// What to show for a clip in the activity list - a data-URL image is a huge
+/// string, so show a short placeholder instead of dumping base64.
+fn label(content: &str) -> &str {
+    if crate::imageclip::is_image(content) {
+        "[image]"
+    } else {
+        content
+    }
 }
 
 // ---- sender: poll the OS clipboard, POST local changes ----
@@ -309,9 +342,10 @@ fn run_sender(sh: Arc<Shared>) {
             return;
         }
     };
-    // Seed the guard with whatever is already on the clipboard, so connecting
-    // doesn't immediately broadcast the user's pre-existing clipboard.
-    if let Ok(cur) = clip.get_text() {
+    // Seed the guard with whatever is already on the clipboard (text OR a
+    // leftover image), so connecting doesn't immediately broadcast the user's
+    // pre-existing clipboard.
+    if let Some(cur) = read_clipboard(&mut clip) {
         if let Ok(mut g) = sh.last.lock() {
             *g = cur;
         }
@@ -322,13 +356,16 @@ fn run_sender(sh: Arc<Shared>) {
         if sh.stopped() {
             break;
         }
-        let cur = match clip.get_text() {
-            Ok(t) => t,
-            Err(_) => continue, // empty or non-text clipboard
-        };
-        if cur.is_empty() {
+        // Skip while muted (just applied a received image - see apply_clip).
+        if sh.mute_until.lock().map(|m| Instant::now() < *m).unwrap_or(false) {
             continue;
         }
+        // Prefer text; fall back to a size-capped image if the clipboard holds
+        // a picture instead. Both travel as a plain string over /clip.
+        let cur = match read_clipboard(&mut clip) {
+            Some(c) => c,
+            None => continue,
+        };
         {
             let mut guard = match sh.last.lock() {
                 Ok(g) => g,
@@ -340,10 +377,22 @@ fn run_sender(sh: Arc<Shared>) {
             *guard = cur.clone();
         }
         match post_clip(&sh.host, sh.port, &cur) {
-            Ok(()) => sh.record(&cur, false),
+            Ok(()) => sh.record(label(&cur), false),
             Err(e) => sh.set_error(Some(format!("Send failed: {e}"))),
         }
     }
+}
+
+/// Read the current clipboard as a sync payload: the text if present, else a
+/// small image as a PNG data URL. `None` when there's nothing (or the image is
+/// too large to send).
+fn read_clipboard(clip: &mut Clipboard) -> Option<String> {
+    if let Ok(t) = clip.get_text() {
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+    crate::imageclip::read_image_data_url(clip)
 }
 
 fn post_clip(host: &str, port: u16, text: &str) -> io::Result<()> {

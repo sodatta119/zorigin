@@ -3,6 +3,7 @@
 // same app and its clipboard stays in sync. Copy on one, it's on the others.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod imageclip;
 mod sync;
 
 use std::net::{IpAddr, Ipv4Addr};
@@ -132,6 +133,9 @@ struct ZuluApp {
     error: Option<String>,
     dark: bool,
     shot_frames: u32,
+    /// Pinned snippets - frequently-pasted text, persisted across runs. Clicking
+    /// one puts it back on the clipboard (and syncs it when connected).
+    pins: Vec<String>,
     /// One-shot guard so `ZULU_AUTOHOST` (a test hook) starts hosting once.
     tried_autohost: bool,
 }
@@ -148,6 +152,7 @@ impl Default for ZuluApp {
             error: None,
             dark: std::env::var("ZULU_DARK").is_ok(),
             shot_frames: 0,
+            pins: load_pins(),
             tried_autohost: false,
         }
     }
@@ -426,6 +431,25 @@ impl ZuluApp {
         });
         ui.add_space(8.0);
 
+        // Pinned snippets.
+        if !self.pins.is_empty() {
+            ui.label(RichText::new("Pinned").size(12.5).weak());
+            ui.add_space(4.0);
+            let mut remove: Option<usize> = None;
+            for (i, text) in self.pins.clone().iter().enumerate() {
+                match pin_row(ui, self.dark, text) {
+                    PinAction::Use => set_clipboard(text),
+                    PinAction::Remove => remove = Some(i),
+                    PinAction::None => {}
+                }
+            }
+            if let Some(i) = remove {
+                self.pins.remove(i);
+                save_pins(&self.pins);
+            }
+            ui.add_space(10.0);
+        }
+
         // Activity list.
         ui.label(RichText::new("Recent clips").size(12.5).weak());
         ui.add_space(4.0);
@@ -433,7 +457,10 @@ impl ZuluApp {
             note(ui, "Copy something on any paired device - it shows up here.");
         } else {
             for (text, incoming) in &snap.recent {
-                clip_row(ui, self.dark, text, *incoming);
+                if clip_row(ui, self.dark, text, *incoming) && !self.pins.iter().any(|p| p == text) {
+                    self.pins.push(text.clone());
+                    save_pins(&self.pins);
+                }
             }
         }
     }
@@ -487,12 +514,10 @@ fn stat(ui: &mut egui::Ui, label: &str, value: u64) {
         });
 }
 
-fn clip_row(ui: &mut egui::Ui, dark: bool, text: &str, incoming: bool) {
-    let fill = if dark {
-        Color32::from_rgb(0x17, 0x17, 0x1A)
-    } else {
-        Color32::WHITE
-    };
+/// A recent-clip row. Returns true if its "Pin" button was clicked.
+fn clip_row(ui: &mut egui::Ui, dark: bool, text: &str, incoming: bool) -> bool {
+    let fill = card_fill(dark);
+    let mut pin = false;
     egui::Frame::default()
         .fill(fill)
         .rounding(10.0)
@@ -505,10 +530,125 @@ fn clip_row(ui: &mut egui::Ui, dark: bool, text: &str, incoming: bool) {
                 paint_dot(ui, color, 4.0);
                 ui.add_space(2.0);
                 let one_line = text.replace('\n', " ");
-                let shown = truncate(&one_line, 58);
-                ui.label(RichText::new(shown).size(13.0));
+                ui.label(RichText::new(truncate(&one_line, 46)).size(13.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    pin = ui
+                        .add(egui::Button::new(RichText::new("Pin").size(12.0)).frame(false))
+                        .on_hover_text("Keep this snippet")
+                        .clicked();
+                });
             });
         });
+    pin
+}
+
+enum PinAction {
+    Use,
+    Remove,
+    None,
+}
+
+/// A pinned-snippet row: click the text to reuse it, "×" to remove it.
+fn pin_row(ui: &mut egui::Ui, dark: bool, text: &str) -> PinAction {
+    let mut action = PinAction::None;
+    egui::Frame::default()
+        .fill(card_fill(dark))
+        .rounding(10.0)
+        .inner_margin(Margin::symmetric(12.0, 8.0))
+        .stroke(egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.5)))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                paint_dot(ui, ACCENT, 4.0);
+                ui.add_space(2.0);
+                let one_line = text.replace('\n', " ");
+                if ui
+                    .add(egui::Button::new(RichText::new(truncate(&one_line, 44)).size(13.0)).frame(false))
+                    .on_hover_text("Copy to clipboard")
+                    .clicked()
+                {
+                    action = PinAction::Use;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(egui::Button::new(RichText::new("×").size(16.0)).frame(false))
+                        .on_hover_text("Unpin")
+                        .clicked()
+                    {
+                        action = PinAction::Remove;
+                    }
+                });
+            });
+        });
+    action
+}
+
+fn card_fill(dark: bool) -> Color32 {
+    if dark {
+        Color32::from_rgb(0x17, 0x17, 0x1A)
+    } else {
+        Color32::WHITE
+    }
+}
+
+// ---- pinned snippets: persistence + clipboard ----
+
+/// Put `text` on the OS clipboard. When a sync session is running, the sender
+/// thread notices and broadcasts it, so reusing a pin also shares it.
+fn set_clipboard(text: &str) {
+    if let Ok(mut c) = arboard::Clipboard::new() {
+        let _ = c.set_text(text.to_string());
+    }
+}
+
+fn pins_path() -> Option<std::path::PathBuf> {
+    let dir = dirs::data_local_dir()?.join("zulu");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("pins.txt"))
+}
+
+/// Load pinned snippets (one per line, newlines escaped).
+fn load_pins() -> Vec<String> {
+    let Some(path) = pins_path() else { return Vec::new() };
+    let Ok(data) = std::fs::read_to_string(path) else { return Vec::new() };
+    data.lines().filter(|l| !l.is_empty()).map(unescape_line).collect()
+}
+
+/// Persist pinned snippets atomically (temp file + rename).
+fn save_pins(pins: &[String]) {
+    let Some(path) = pins_path() else { return };
+    let body: String = pins.iter().map(|p| format!("{}\n", escape_line(p))).collect();
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, body).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+/// Escape a snippet to a single line: backslash then newline/carriage-return.
+fn escape_line(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\n', "\\n").replace('\r', "\\r")
+}
+
+/// Inverse of [`escape_line`].
+fn unescape_line(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Draw a small filled status dot inline (default egui fonts lack a reliable
@@ -613,6 +753,23 @@ fn crc32(data: &[u8]) -> u32 {
         }
     }
     !crc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{escape_line, unescape_line};
+
+    #[test]
+    fn pin_escaping_round_trips() {
+        for s in ["plain", "two\nlines", "back\\slash", "crlf\r\nhere", "mix\\n\nreal", ""] {
+            assert_eq!(unescape_line(&escape_line(s)), s, "round trip {s:?}");
+        }
+    }
+
+    #[test]
+    fn escaped_pin_is_single_line() {
+        assert!(!super::escape_line("a\nb\nc").contains('\n'), "no raw newlines in the on-disk form");
+    }
 }
 
 fn zlib_stored(data: &[u8]) -> Vec<u8> {

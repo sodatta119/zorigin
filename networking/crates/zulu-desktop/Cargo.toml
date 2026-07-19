@@ -19,6 +19,9 @@ dirs = "5"
 # egui can only read via paste events, so Zulu needs a real clipboard crate to
 # poll for local copies on desktop.
 arboard = "3"
+# PNG encode/decode for small clipboard-image sync (PNG only keeps the build lean;
+# arboard already pulls image transitively for its own image-data support).
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [package.metadata.bundle]
 name = "Zulu"

@@ -178,13 +178,37 @@ appears on B, auto-pasted. ✅ **Shipped and verified.**
   showed in `GET /clips` (send). Plus 25 core tests + the app's unit tests, all
   green.
 
-**Next:** the **Android share-target sender** and **tap-to-copy receiver**;
-optional clip-history backfill on connect (`GET /clips` is ready); then small
-images and pinned snippets.
+### Shipped since the milestone (2026-07-19)
+
+- **History backfill on connect** - `/events` replays the recent clips (oldest
+  first) to a freshly-connected device as its first frames, so a late joiner
+  lands in sync with no separate fetch and no client-side JSON parsing
+  (`EventHub::subscribe_with_backfill`). The desktop app id-dedups so a
+  reconnect's replay isn't re-applied.
+- **No-app web receiver** - `ServeConfig.index_html` lets `znet-core` serve an
+  app-supplied SPA at `/`; Zulu ships `zulu.html`: a live EventSource clip list
+  (+ backfill), presence, a paste-and-send box, and tap-to-copy with an
+  `execCommand` fallback for plain-http LAN (the async Clipboard API needs a
+  secure context). Verified in a real browser.
+- **Small images** - clips can be a `data:image/png;base64,…` URL, so images
+  ride the same `/clip` + SSE path as text. The desktop sends/receives clipboard
+  images (`arboard` + `image`, downscaled to ≤1600px, capped ~700 KB); the web
+  receiver renders them inline. Echo is broken by a content guard plus a short
+  post-apply mute (the OS can re-encode an image on the clipboard round-trip).
+  Verified: a posted image rendered once in the browser, no echo.
+- **Pinned snippets** - pin any recent clip; pins persist to
+  `<app-data>/zulu/pins.txt` (newline-escaped) and reappear next run. Clicking a
+  pin puts it back on the clipboard (and syncs it when connected).
+
+**Next:** a **native Android app** (share-target sender + tap-to-copy) - the web
+receiver already covers Android *browsers*, but a true system share-sheet needs
+either TLS (for a PWA Web Share Target - service workers require a secure
+context) or a Kotlin shell. Then end-to-end **encryption** (`rustls`, H1.5).
 
 > Run it: `cargo run -p zulu-desktop` on two machines on the same Wi-Fi - one
-> Host, one Join with the shown URL. (Milestone server is open/no-auth; the `?k=`
-> pairing key and TLS are later phases.)
+> Host, one Join with the shown URL. Any phone/laptop **browser** can also open
+> the host URL for the no-app receiver. (Milestone server is open/no-auth; the
+> `?k=` pairing key and TLS are later phases.)
 
 ---
 

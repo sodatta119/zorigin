@@ -55,6 +55,7 @@
   .clip-text { flex: 1; min-width: 0; font-size: 14px; line-height: 1.45; word-break: break-word;
     white-space: pre-wrap; max-height: 7.5em; overflow: hidden; }
   .clip-text.link { color: var(--accent); }
+  .clip-text img { max-width: 100%; max-height: 220px; border-radius: 7px; display: block; }
   .copy { background: var(--card2); color: var(--text); border: 1px solid var(--border);
     padding: 6px 12px; font-size: 13px; flex: none; }
   .copy.copied { background: var(--ok); color: var(--ink); border-color: transparent; }
@@ -129,17 +130,27 @@
     document.body.removeChild(ta);
   }
 
+  function isImage(t) { return t.indexOf('data:image/') === 0; }
+
   function addClip(text) {
     if (!text) return;
     empty.style.display = 'none';
     var li = document.createElement('li');
     var span = document.createElement('div');
-    span.className = 'clip-text' + (looksLikeLink(text) ? ' link' : '');
-    span.textContent = text;
-    var btn = document.createElement('button');
-    btn.className = 'copy'; btn.textContent = 'Copy';
-    btn.addEventListener('click', function () { copyText(text, btn); });
-    li.appendChild(span); li.appendChild(btn);
+    span.className = 'clip-text';
+    if (isImage(text)) {
+      var img = document.createElement('img');
+      img.src = text; img.alt = 'shared image';
+      span.appendChild(img);
+      li.appendChild(span);                         // image clips: view only
+    } else {
+      if (looksLikeLink(text)) span.className += ' link';
+      span.textContent = text;
+      var btn = document.createElement('button');
+      btn.className = 'copy'; btn.textContent = 'Copy';
+      btn.addEventListener('click', function () { copyText(text, btn); });
+      li.appendChild(span); li.appendChild(btn);
+    }
     list.insertBefore(li, list.firstChild);         // newest on top
     while (list.children.length > 50) list.removeChild(list.lastChild);
   }
