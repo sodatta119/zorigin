@@ -190,12 +190,15 @@ appears on B, auto-pasted. ✅ **Shipped and verified.**
   (+ backfill), presence, a paste-and-send box, and tap-to-copy with an
   `execCommand` fallback for plain-http LAN (the async Clipboard API needs a
   secure context). Verified in a real browser.
-- **Small images** - clips can be a `data:image/png;base64,…` URL, so images
-  ride the same `/clip` + SSE path as text. The desktop sends/receives clipboard
-  images (`arboard` + `image`, downscaled to ≤1600px, capped ~700 KB); the web
+- **Small images** - clips can be a `data:image/…;base64,…` URL, so images ride
+  the same `/clip` + SSE path as text. The desktop sends/receives clipboard
+  images (`arboard` + `image`; PNG out, PNG+JPEG in), downscaled to ≤2560px and
+  capped ~4 MB (server clip cap raised to 8 MiB to fit the base64); the web
   receiver renders them inline. Echo is broken by a content guard plus a short
   post-apply mute (the OS can re-encode an image on the clipboard round-trip).
-  Verified: a posted image rendered once in the browser, no echo.
+  Android **shares images too**: the share sheet accepts `image/*`, downscales +
+  JPEG-encodes to a data URL, and POSTs it to `/clip`. Verified: a posted image
+  rendered once in the browser (no echo); a >1 MiB clip is stored intact.
 - **Pinned snippets** - pin any recent clip; pins persist to
   `<app-data>/zulu/pins.txt` (newline-escaped) and reappear next run. Clicking a
   pin puts it back on the clipboard (and syncs it when connected).

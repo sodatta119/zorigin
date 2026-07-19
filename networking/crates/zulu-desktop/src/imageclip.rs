@@ -17,11 +17,11 @@ use arboard::{Clipboard, ImageData};
 use image::{DynamicImage, ImageFormat, RgbaImage};
 
 /// Longest side an image is scaled down to before sending.
-const MAX_DIM: u32 = 1600;
-/// Largest PNG we'll send (keeps the base64 body under the server's 1 MiB clip
-/// cap and the history ring reasonable). Bigger images are skipped, not sent
-/// blurry - stated plainly rather than silently degrading.
-const MAX_PNG_BYTES: usize = 700_000;
+const MAX_DIM: u32 = 2560;
+/// Largest PNG we'll send (its base64 must stay under the server's clip cap, and
+/// the history ring reasonable). Bigger images are skipped, not sent blurry -
+/// stated plainly rather than silently degrading.
+const MAX_PNG_BYTES: usize = 4_000_000;
 
 const PREFIX: &str = "data:image/png;base64,";
 

@@ -5,7 +5,7 @@
     <string name="host_label">Host URL (from the desktop Zulu window)</string>
     <string name="save">Save</string>
     <string name="open_receiver">Open receiver (tap-to-copy)</string>
-    <string name="how_to">Send from your phone: Share any text or link and pick “Zulu”. Receive: open the receiver and tap Copy on a clip. (Phones can’t auto-read the clipboard in the background — that’s an OS limit, not a bug.)</string>
+    <string name="how_to">Send from your phone: Share text, a link, or an image and pick “Zulu”. Receive: open the receiver and tap Copy on a clip. (Phones can’t auto-read the clipboard in the background — that’s an OS limit, not a bug.)</string>
     <string name="saved">Host saved</string>
     <string name="set_host_first">Set the host URL first</string>
     <string name="not_paired">Not paired yet — paste the host URL and Save.</string>

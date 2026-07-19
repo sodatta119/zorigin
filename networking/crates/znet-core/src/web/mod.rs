@@ -712,8 +712,9 @@ fn serve_events(request: Request, hub: &EventHub, clips: &ClipStore) -> Result<(
 }
 
 /// Largest clip body accepted, to bound memory from a hostile or buggy client.
-/// Clips are small text by design; images (later) get their own size handling.
-const MAX_CLIP_BYTES: u64 = 1 << 20; // 1 MiB
+/// Text clips are tiny; the headroom is for small images sent as base64 data
+/// URLs (a downscaled screenshot base64-expands to a few MB).
+const MAX_CLIP_BYTES: u64 = 8 << 20; // 8 MiB
 
 /// `POST /clip`: the request body is the raw clip text. Store it in the ring and
 /// broadcast it to every `/events` listener as a `clip` event, so all paired
@@ -2328,6 +2329,33 @@ mod tests {
         .into_owned();
         assert!(clips.contains("\"id\":0"), "backfill has the clip: {clips}");
         assert!(clips.contains("line1\\nline2"), "backfill JSON-escapes newlines: {clips}");
+
+        handle.stop();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A clip larger than the old 1 MiB limit (e.g. a small image as a base64
+    /// data URL) must be stored intact, not truncated - guards `MAX_CLIP_BYTES`.
+    #[test]
+    fn large_clip_within_cap_is_stored_intact() {
+        let _g = port_guard();
+        let dir = std::env::temp_dir().join(format!("zap-bigclip-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let (port, handle) = spawn_test_server(&dir);
+
+        let body = "x".repeat(2_000_000); // ~2 MB, over the previous 1 MiB cap
+        let head = format!(
+            "POST /clip HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let resp = String::from_utf8_lossy(&send_raw(port, &head, body.as_bytes())).into_owned();
+        assert!(resp.contains("\"id\":0"), "big clip accepted: {}", &resp[..resp.len().min(120)]);
+
+        let clips = send_raw(port, "GET /clips HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n", b"");
+        let x_run = clips.iter().filter(|&&b| b == b'x').count();
+        // The whole 2 MB survives (the old 1 MiB cap would have truncated to
+        // ~1.05M). Not an exact `==` since the framing can carry a stray byte.
+        assert!(x_run >= 2_000_000, "full clip stored, not truncated: got {x_run} x's");
 
         handle.stop();
         let _ = fs::remove_dir_all(&dir);
