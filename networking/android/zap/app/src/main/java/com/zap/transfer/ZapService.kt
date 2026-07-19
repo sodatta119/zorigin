@@ -7,6 +7,9 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Environment
@@ -26,6 +29,7 @@ class ZapService : Service() {
     private var handle: Long = 0L
     private var wifiLock: WifiManager.WifiLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var netCallback: ConnectivityManager.NetworkCallback? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -51,7 +55,10 @@ class ZapService : Service() {
         handle = NativeBridge.nativeStart(dir, PORT, user, pass, history)
         val url = if (handle != 0L) NativeBridge.nativeUrl(handle) else null
 
-        if (handle != 0L) acquireLocks()
+        if (handle != 0L) {
+            acquireLocks()
+            keepWifiUp()
+        }
         createChannel()
         startAsForeground(buildNotification(url))
         ZapState.update(url, handle != 0L, handle)
@@ -91,6 +98,41 @@ class ZapService : Service() {
         wakeLock = null
     }
 
+    /**
+     * Hold an active request for a Wi-Fi network for as long as we're serving.
+     *
+     * On a phone-hosted server the real killer isn't the app being killed - it's
+     * the *radio*: with the screen off and a weak-ish signal, Android/MIUI tears
+     * Wi-Fi down and switches to mobile data ("Wi-Fi disconnected, isMobileData
+     * =true"), which yanks the LAN IP out from under an in-flight download. An
+     * outstanding requestNetwork(TRANSPORT_WIFI) is the framework's vote to keep
+     * Wi-Fi alive, so the system won't drop it while a transfer is running.
+     * We don't bind traffic to it - just express the need. Released in onDestroy.
+     */
+    private fun keepWifiUp() {
+        if (netCallback != null) return
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return
+        val req = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .build()
+        val cb = object : ConnectivityManager.NetworkCallback() {}
+        try {
+            cm.requestNetwork(req, cb)
+            netCallback = cb
+        } catch (_: Exception) {
+            netCallback = null
+        }
+    }
+
+    private fun releaseWifi() {
+        val cb = netCallback ?: return
+        try {
+            getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb)
+        } catch (_: Exception) {
+        }
+        netCallback = null
+    }
+
     private fun startAsForeground(notification: Notification) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
@@ -124,6 +166,7 @@ class ZapService : Service() {
             handle = 0L
         }
         releaseLocks()
+        releaseWifi()
         ZapState.update(null, false, 0L)
         super.onDestroy()
     }

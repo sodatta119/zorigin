@@ -174,6 +174,15 @@ class MainActivity : AppCompatActivity() {
     private fun render() {
         val running = ZapState.running
         val url = ZapState.url
+        // Keep the screen on while this screen is open and serving: a screen-off
+        // phone drops Wi-Fi power-save (and MIUI may disconnect Wi-Fi entirely),
+        // which stalls/kills in-flight transfers. The ZapService also votes to
+        // keep Wi-Fi up for the backgrounded case.
+        if (running) {
+            window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
         // A localhost URL means no Wi-Fi/LAN IP was found - warn instead.
         val noWifi = running && (url == null || url.contains("localhost") || url.contains("127.0.0.1"))
         val reachable = running && !noWifi
