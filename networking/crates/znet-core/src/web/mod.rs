@@ -26,6 +26,8 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod clips;
 mod events;
+mod fast;
+pub mod fast_client;
 pub use clips::{Clip, ClipStore};
 pub use events::{Event, EventHub};
 
@@ -142,6 +144,12 @@ pub struct ServerHandle {
     acceptor: Option<thread::JoinHandle<()>>,
     stats: Arc<Stats>,
     hub: EventHub,
+    /// The optional native-to-native fast-lane listener. `None` when it is not
+    /// running (e.g. HTTPS is on, or it failed to bind). Held purely as an RAII
+    /// guard: dropping it (when the handle drops) stops the listener and frees
+    /// its port, so it lives exactly as long as the HTTP server.
+    #[allow(dead_code)]
+    fast: Option<fast::FastHandle>,
 }
 
 /// Direction of a transfer, from the server's point of view.
@@ -454,9 +462,37 @@ pub fn serve(config: ServeConfig, on_ready: impl FnOnce(&ServerInfo)) -> Result<
     let hub = EventHub::new();
     let clips = Arc::new(ClipStore::new());
     let index = index_of(&config);
+    // Start the optional native-to-native fast lane and advertise its port via
+    // /api/capabilities. Held in `fast` for the server's lifetime.
+    let fast = start_fast(&config, &dir, &auth, &stats);
+    let fast_port = fast.as_ref().map(|h| h.port);
     // Use the calling thread as the acceptor; blocks until the process exits.
-    accept_loop(&server, &dir, &auth, &stats, &hub, &clips, &index);
+    accept_loop(&server, &dir, &auth, &stats, &hub, &clips, &index, fast_port);
+    drop(fast);
     Ok(())
+}
+
+/// Start the fast-lane listener when appropriate, returning its handle. Returns
+/// `None` when the fast lane should not run: currently whenever HTTPS is on (v1's
+/// fast lane is plain TCP, so it is only advertised on plain-HTTP servers - no
+/// silent downgrade), or if the listener fails to bind (then native clients just
+/// use HTTP). Fast-lane TLS in a later phase will let it run under HTTPS too.
+fn start_fast(
+    config: &ServeConfig,
+    dir: &Arc<PathBuf>,
+    auth: &Arc<Option<Auth>>,
+    stats: &Arc<Stats>,
+) -> Option<fast::FastHandle> {
+    if config.tls.is_some() {
+        return None;
+    }
+    match fast::spawn_listener(config.bind, Arc::clone(dir), Arc::clone(auth), Arc::clone(stats)) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            eprintln!("zap: fast lane unavailable ({e}); native clients will use HTTP");
+            None
+        }
+    }
 }
 
 /// The SPA to serve at `/`: the app's override if given, else the built-in Zap UI.
@@ -480,6 +516,8 @@ pub fn spawn(config: ServeConfig) -> Result<(ServerInfo, ServerHandle)> {
     let hub = EventHub::new();
     let clips = Arc::new(ClipStore::new());
     let index = index_of(&config);
+    let fast = start_fast(&config, &dir, &auth, &stats);
+    let fast_port = fast.as_ref().map(|h| h.port);
     let acceptor = {
         let server = Arc::clone(&server);
         let dir = Arc::clone(&dir);
@@ -488,7 +526,9 @@ pub fn spawn(config: ServeConfig) -> Result<(ServerInfo, ServerHandle)> {
         let hub = hub.clone();
         let clips = Arc::clone(&clips);
         let index = Arc::clone(&index);
-        thread::spawn(move || accept_loop(&server, &dir, &auth, &stats, &hub, &clips, &index))
+        thread::spawn(move || {
+            accept_loop(&server, &dir, &auth, &stats, &hub, &clips, &index, fast_port)
+        })
     };
     Ok((
         info,
@@ -497,6 +537,7 @@ pub fn spawn(config: ServeConfig) -> Result<(ServerInfo, ServerHandle)> {
             acceptor: Some(acceptor),
             stats,
             hub,
+            fast,
         },
     ))
 }
@@ -579,6 +620,7 @@ fn accept_loop(
     hub: &EventHub,
     clips: &Arc<ClipStore>,
     index: &Arc<str>,
+    fast_port: Option<u16>,
 ) {
     for request in server.incoming_requests() {
         // A request arriving at all proves a client reached this host.
@@ -590,7 +632,9 @@ fn accept_loop(
         let clips = Arc::clone(clips);
         let index = Arc::clone(index);
         thread::spawn(move || {
-            if let Err(e) = handle(request, &dir, (*auth).as_ref(), &stats, &hub, &clips, &index) {
+            if let Err(e) =
+                handle(request, &dir, (*auth).as_ref(), &stats, &hub, &clips, &index, fast_port)
+            {
                 eprintln!("zap: request error: {e:#}");
             }
         });
@@ -605,6 +649,7 @@ fn handle(
     hub: &EventHub,
     clips: &Arc<ClipStore>,
     index: &str,
+    fast_port: Option<u16>,
 ) -> Result<()> {
     let method = request.method().clone();
     let raw_url = request.url().to_string();
@@ -654,6 +699,13 @@ fn handle(
         (Method::Post, "/clip") => handle_post_clip(request, clips, hub),
         // Recent clips, for a device that just connected to backfill history.
         (Method::Get, "/clips") => respond(request, json_response(&clips_json(clips))),
+        // Native-to-native fast-lane discovery. Browsers never call this - they
+        // just render the page - so the browser path is unaffected. A native
+        // client reads the advertised port here, then connects to the fast lane
+        // (falling back to HTTP if it is absent or unreachable).
+        (Method::Get, "/api/capabilities") => {
+            respond(request, json_response(&capabilities_json(fast_port)))
+        }
         (Method::Get, "/api/list") => {
             let rel = query_param(query, "path").map(decode_percent).unwrap_or_default();
             respond(request, json_response(&list_dir_json(dir, &rel)))
@@ -694,6 +746,21 @@ fn handle(
             discard_partial(request, dir, &rel, name.as_deref())
         }
         _ => respond(request, Response::from_string("Not found").with_status_code(404)),
+    }
+}
+
+/// The `GET /api/capabilities` body. Advertises the fast lane when it is
+/// running (`fast_port` set), else `fast:null`. `tls` is always `false` in v1
+/// because the listener is only started on plain-HTTP servers (see
+/// [`start_fast`]); a later phase runs it under the shared cert and reports the
+/// real value here.
+fn capabilities_json(fast_port: Option<u16>) -> String {
+    match fast_port {
+        Some(port) => format!(
+            "{{\"fast\":{{\"port\":{port},\"tls\":false,\"version\":{}}}}}",
+            fast::VERSION
+        ),
+        None => "{\"fast\":null}".to_string(),
     }
 }
 
@@ -2674,6 +2741,205 @@ mod tests {
         assert!(read_until(&mut stream, &mut buf, "event: clip"), "broadcast should arrive");
         let text = String::from_utf8_lossy(&buf);
         assert!(text.contains("data: hello over the wire"), "frame payload: {text}");
+
+        handle.stop();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- Fast lane: capabilities, byte-exact download, resume, auth ----
+
+    /// A deterministic byte pattern larger than one streaming chunk, so a
+    /// download exercises multiple read/write loops and a real CRC.
+    fn payload(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| {
+                let x = (i as u32).wrapping_mul(2_654_435_761);
+                (x >> 13) as u8 ^ (i as u8)
+            })
+            .collect()
+    }
+
+    /// Read `GET /api/capabilities` from a running server and return the
+    /// advertised fast-lane port (or `None`). Sends the token as the session
+    /// cookie when the server is secured.
+    fn advertised_fast_port(http_port: u16, token: Option<&str>) -> Option<u16> {
+        let cookie = token
+            .map(|t| format!("Cookie: zap_session={t}\r\n"))
+            .unwrap_or_default();
+        let head = format!(
+            "GET /api/capabilities HTTP/1.1\r\nHost: x\r\n{cookie}Connection: close\r\n\r\n"
+        );
+        let resp = send_raw(http_port, &head, b"");
+        let text = String::from_utf8_lossy(&resp);
+        let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        if compact.contains("\"fast\":null") {
+            return None;
+        }
+        let i = compact.find("\"port\":")?;
+        let after = &compact[i + "\"port\":".len()..];
+        after
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .ok()
+    }
+
+    /// Do one raw fast-lane handshake and return the reply status byte.
+    fn fast_handshake_status(fast_port: u16, token: &str, path: &str) -> u8 {
+        use std::net::TcpStream;
+        let mut s = TcpStream::connect(("127.0.0.1", fast_port)).expect("connect fast lane");
+        let mut hs = Vec::new();
+        hs.extend_from_slice(fast::MAGIC);
+        hs.extend_from_slice(&fast::VERSION.to_le_bytes());
+        hs.push(fast::OP_GET);
+        hs.extend_from_slice(&(token.len() as u16).to_le_bytes());
+        hs.extend_from_slice(token.as_bytes());
+        hs.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        hs.extend_from_slice(path.as_bytes());
+        hs.extend_from_slice(&0u64.to_le_bytes());
+        hs.extend_from_slice(&0u64.to_le_bytes());
+        s.write_all(&hs).expect("write handshake");
+        s.flush().ok();
+        let mut st = [0u8; 1];
+        s.read_exact(&mut st).expect("read status");
+        st[0]
+    }
+
+    /// `capabilities_json` reports the fast-lane port when running, else null.
+    #[test]
+    fn capabilities_json_reports_port_or_null() {
+        assert_eq!(capabilities_json(None), "{\"fast\":null}");
+        let s = capabilities_json(Some(41234));
+        assert!(s.contains("\"port\":41234"), "port advertised: {s}");
+        assert!(s.contains("\"tls\":false"), "plain in v1: {s}");
+        assert!(s.contains("\"version\":1"), "version present: {s}");
+    }
+
+    /// The fast lane must not run (or be advertised) while HTTPS is on, so an
+    /// encrypted setup never silently downgrades to a plain fast lane in v1.
+    #[test]
+    fn fast_lane_not_started_under_tls() {
+        let dir = Arc::new(std::env::temp_dir());
+        let auth: Arc<Option<Auth>> = Arc::new(None);
+        let stats = Arc::new(Stats::new(None));
+        let cfg = ServeConfig {
+            dir: (*dir).clone(),
+            port: 0,
+            bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            auth: None,
+            history: None,
+            index_html: None,
+            tls: Some(TlsMaterial {
+                cert_pem: Vec::new(),
+                key_pem: Vec::new(),
+                fingerprint: "deadbeef".to_string(),
+            }),
+        };
+        assert!(start_fast(&cfg, &dir, &auth, &stats).is_none());
+    }
+
+    /// End-to-end: a native client downloads a file over the fast lane, and the
+    /// result is byte-exact and CRC-verified.
+    #[test]
+    fn fast_get_downloads_byte_exact() {
+        let _g = port_guard();
+        let src_dir = std::env::temp_dir().join(format!("zap-fast-src-{}", std::process::id()));
+        let dst_dir = std::env::temp_dir().join(format!("zap-fast-dst-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&src_dir);
+        let _ = fs::remove_dir_all(&dst_dir);
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::create_dir_all(&dst_dir).unwrap();
+        let data = payload(500_000);
+        fs::write(src_dir.join("payload.bin"), &data).unwrap();
+
+        let (port, handle) = spawn_test_server(&src_dir);
+        // The listener is advertised on a plain-HTTP server.
+        assert!(advertised_fast_port(port, None).is_some(), "fast lane advertised");
+
+        let url = format!("http://127.0.0.1:{port}/download?path=payload.bin");
+        let report = fast_client::get(&url, &dst_dir).expect("fast get");
+        assert!(report.used_fast, "should use the fast lane");
+        assert!(report.verified, "whole-file CRC should verify");
+        assert_eq!(report.total, data.len() as u64);
+        let got = fs::read(dst_dir.join("payload.bin")).unwrap();
+        assert_eq!(got, data, "downloaded bytes must match exactly");
+        // The temp file must be gone once finalized.
+        assert!(!dst_dir.join(".zap-part-payload.bin").exists(), "temp file removed");
+
+        handle.stop();
+        let _ = fs::remove_dir_all(&src_dir);
+        let _ = fs::remove_dir_all(&dst_dir);
+    }
+
+    /// A partial `.zap-part-` file already on disk is resumed from its offset, not
+    /// restarted, and the assembled file is still byte-exact.
+    #[test]
+    fn fast_get_resumes_from_partial() {
+        let _g = port_guard();
+        let src_dir = std::env::temp_dir().join(format!("zap-fastr-src-{}", std::process::id()));
+        let dst_dir = std::env::temp_dir().join(format!("zap-fastr-dst-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&src_dir);
+        let _ = fs::remove_dir_all(&dst_dir);
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::create_dir_all(&dst_dir).unwrap();
+        let data = payload(300_000);
+        fs::write(src_dir.join("payload.bin"), &data).unwrap();
+
+        // Pre-seed the first 100_000 bytes as an interrupted download.
+        let seeded = 100_000usize;
+        fs::write(dst_dir.join(".zap-part-payload.bin"), &data[..seeded]).unwrap();
+
+        let (port, handle) = spawn_test_server(&src_dir);
+        let url = format!("http://127.0.0.1:{port}/download?path=payload.bin");
+        let report = fast_client::get(&url, &dst_dir).expect("fast get resume");
+        assert!(report.used_fast, "should use the fast lane");
+        assert_eq!(report.resumed_from, seeded as u64, "should resume from the on-disk offset");
+        let got = fs::read(dst_dir.join("payload.bin")).unwrap();
+        assert_eq!(got, data, "resumed download must be byte-exact");
+
+        handle.stop();
+        let _ = fs::remove_dir_all(&src_dir);
+        let _ = fs::remove_dir_all(&dst_dir);
+    }
+
+    /// On a secured server the handshake token must match the session token: a
+    /// wrong token is rejected, the correct one is accepted.
+    #[test]
+    fn fast_lane_rejects_wrong_token() {
+        let _g = port_guard();
+        let dir = std::env::temp_dir().join(format!("zap-fasttok-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("payload.bin"), payload(2_048)).unwrap();
+
+        let port = free_port();
+        let (info, handle) = spawn(ServeConfig {
+            dir: dir.clone(),
+            port,
+            bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            auth: Some(Credentials {
+                user: "zap".to_string(),
+                pass: "zap".to_string(),
+            }),
+            history: None,
+            index_html: None,
+            tls: None,
+        })
+        .expect("bind secured");
+        let token = info.auth_token.clone().expect("secured server has a token");
+
+        let fp = advertised_fast_port(port, Some(&token)).expect("fast port via capabilities");
+        assert_eq!(
+            fast_handshake_status(fp, "not-the-token", "payload.bin"),
+            fast::ST_UNAUTHORIZED,
+            "wrong token must be rejected"
+        );
+        assert_eq!(
+            fast_handshake_status(fp, &token, "payload.bin"),
+            fast::ST_OK,
+            "correct token must be accepted"
+        );
 
         handle.stop();
         let _ = fs::remove_dir_all(&dir);

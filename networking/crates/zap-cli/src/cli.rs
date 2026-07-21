@@ -53,6 +53,18 @@ pub enum Command {
         remote: String,
     },
 
+    /// Download a file from another Zap over the LAN, using the native fast lane
+    /// when available and falling back to HTTP. Give it a Zap download link, e.g.
+    /// `zap get "http://192.168.1.5:8080/download?path=movie.mp4&k=<token>" ~/Downloads`.
+    Get {
+        /// Zap download URL. Must include `?path=<file>`; add `&k=<token>` if the
+        /// server is secured. Plain http:// only for now.
+        url: String,
+        /// Destination file or directory (defaults to the current directory).
+        #[arg(default_value = ".")]
+        dest: String,
+    },
+
     /// Start a web server so a phone can transfer files over Wi-Fi (no app).
     Serve {
         /// Directory to share and to receive uploads into.

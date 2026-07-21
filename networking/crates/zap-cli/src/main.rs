@@ -58,6 +58,10 @@ fn run() -> Result<()> {
             )
         }
 
+        // LAN download over the native fast lane (HTTP fallback). Not a
+        // host-driven Transport - it drives another Zap's web/fast-lane server.
+        Command::Get { url, dest } => cmd_get(&url, &dest),
+
         Command::Devices => {
             let transport = build_transport(cli.transport)?;
             cmd_devices(transport.as_ref())
@@ -78,6 +82,25 @@ fn run() -> Result<()> {
             transport.push(&device, &local, &remote)
         }
     }
+}
+
+/// Download a file from a Zap share link, using the fast lane when the peer
+/// advertises one and falling back to HTTP otherwise.
+fn cmd_get(url: &str, dest: &str) -> Result<()> {
+    let report = web::fast_client::get(url, std::path::Path::new(dest))?;
+    let lane = if report.used_fast { "fast lane" } else { "HTTP" };
+    let verified = if report.verified { ", integrity verified" } else { "" };
+    let resumed = if report.resumed_from > 0 {
+        format!(" (resumed from {} bytes)", report.resumed_from)
+    } else {
+        String::new()
+    };
+    println!(
+        "downloaded {} - {} bytes via {lane}{verified}{resumed}",
+        report.path.display(),
+        report.total
+    );
+    Ok(())
 }
 
 fn build_transport(kind: TransportKind) -> Result<Box<dyn Transport>> {
