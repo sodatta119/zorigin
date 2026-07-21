@@ -63,6 +63,9 @@ struct Target {
     token: Option<String>,
     /// The leaf filename to save as.
     filename: String,
+    /// The pinned cert fingerprint (`&fp=`) when the peer is HTTPS; `None` for a
+    /// plain-HTTP peer. Its presence means every hop to this peer uses TLS.
+    tls_fp: Option<String>,
 }
 
 /// Tunables for the fast lane. `streams` is the number of parallel TCP
@@ -598,17 +601,79 @@ fn fast_stat(t: &Target, fast_port: u16) -> Result<(u64, Option<u32>)> {
     Ok((total, crc))
 }
 
-/// Open a fast-lane connection with sensible socket options.
-fn connect_fast(t: &Target, fast_port: u16) -> Result<TcpStream> {
-    let stream = TcpStream::connect((t.host.as_str(), fast_port))
-        .with_context(|| format!("connecting to fast lane {}:{fast_port}", t.host))?;
-    stream.set_nodelay(true).ok();
-    stream.set_read_timeout(Some(Duration::from_secs(60))).ok();
-    Ok(stream)
+/// A client connection to a Zap peer: plain TCP, or (under the `tls` feature) a
+/// rustls client stream that pins the server's certificate fingerprint. Used for
+/// both the fast lane and the HTTP control channel so an HTTPS server is spoken
+/// to correctly on every hop.
+enum Conn {
+    Plain(TcpStream),
+    #[cfg(feature = "tls")]
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl Read for Conn {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Conn::Plain(s) => s.read(buf),
+            #[cfg(feature = "tls")]
+            Conn::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Conn {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Conn::Plain(s) => s.write(buf),
+            #[cfg(feature = "tls")]
+            Conn::Tls(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Conn::Plain(s) => s.flush(),
+            #[cfg(feature = "tls")]
+            Conn::Tls(s) => s.flush(),
+        }
+    }
+}
+
+/// Connect to `host:port`, wrapping in a pinned TLS session when `tls_fp` is set.
+fn connect(host: &str, port: u16, tls_fp: Option<&str>) -> Result<Conn> {
+    let tcp = TcpStream::connect((host, port))
+        .with_context(|| format!("connecting to {host}:{port}"))?;
+    tcp.set_nodelay(true).ok();
+    tcp.set_read_timeout(Some(Duration::from_secs(60))).ok();
+    match tls_fp {
+        None => Ok(Conn::Plain(tcp)),
+        Some(fp) => connect_tls(tcp, host, fp),
+    }
+}
+
+#[cfg(feature = "tls")]
+fn connect_tls(tcp: TcpStream, host: &str, fp: &str) -> Result<Conn> {
+    let cfg = super::fast_tls::client_config(fp);
+    // The fingerprint verifier ignores the name, but rustls still needs a valid
+    // ServerName; use the host (IP or DNS), falling back to a placeholder.
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+        .unwrap_or_else(|_| rustls::pki_types::ServerName::try_from("localhost").unwrap());
+    let conn = rustls::ClientConnection::new(cfg, server_name)
+        .map_err(|e| anyhow!("TLS setup: {e}"))?;
+    Ok(Conn::Tls(Box::new(rustls::StreamOwned::new(conn, tcp))))
+}
+
+#[cfg(not(feature = "tls"))]
+fn connect_tls(_tcp: TcpStream, _host: &str, _fp: &str) -> Result<Conn> {
+    bail!("this build has no TLS support; rebuild with `--features tls` to use an encrypted (https) server")
+}
+
+/// Open a fast-lane connection (TLS-wrapped when the peer is encrypted).
+fn connect_fast(t: &Target, fast_port: u16) -> Result<Conn> {
+    connect(&t.host, fast_port, t.tls_fp.as_deref())
 }
 
 /// Write a GET handshake for `[offset, offset+range_len)` (range_len 0 = to EOF).
-fn write_handshake(stream: &mut TcpStream, t: &Target, offset: u64, range_len: u64) -> Result<()> {
+fn write_handshake(stream: &mut Conn, t: &Target, offset: u64, range_len: u64) -> Result<()> {
     let token = t.token.clone().unwrap_or_default();
     let path_bytes = t.file_path.as_bytes();
     let mut hs = Vec::with_capacity(27 + token.len() + path_bytes.len());
@@ -628,7 +693,7 @@ fn write_handshake(stream: &mut TcpStream, t: &Target, offset: u64, range_len: u
 
 /// Read a handshake reply: `Ok((total_size, optional_crc))`, or an error carrying
 /// the server's message.
-fn read_reply(stream: &mut TcpStream) -> Result<(u64, Option<u32>)> {
+fn read_reply(stream: &mut Conn) -> Result<(u64, Option<u32>)> {
     let mut status = [0u8; 1];
     stream.read_exact(&mut status)?;
     if status[0] != fast::ST_OK {
@@ -803,7 +868,7 @@ fn fast_put_once(
 /// Write a PUT handshake: op=PUT, destination `path`, the whole-file `total`, and
 /// an optional whole-file CRC the server verifies on completion. `offset` is sent
 /// as 0 - the server replies with the authoritative resume offset.
-fn write_put_handshake(stream: &mut TcpStream, token: &str, path: &str, total: u64, crc: Option<u32>) -> Result<()> {
+fn write_put_handshake(stream: &mut Conn, token: &str, path: &str, total: u64, crc: Option<u32>) -> Result<()> {
     let path_bytes = path.as_bytes();
     let mut hs = Vec::with_capacity(32 + token.len() + path_bytes.len());
     hs.extend_from_slice(fast::MAGIC);
@@ -829,7 +894,7 @@ fn write_put_handshake(stream: &mut TcpStream, token: &str, path: &str, total: u
 
 /// Read a PUT handshake reply: `Ok(offset)` (the byte offset to start sending
 /// from), or an error carrying the server's message.
-fn read_put_reply(stream: &mut TcpStream) -> Result<u64> {
+fn read_put_reply(stream: &mut Conn) -> Result<u64> {
     let mut status = [0u8; 1];
     stream.read_exact(&mut status)?;
     if status[0] != fast::ST_OK {
@@ -857,7 +922,7 @@ fn http_download(t: &Target, part: &Path) -> Result<(u64, u64)> {
         headers.push(("Range".to_string(), format!("bytes={on_disk}-")));
     }
     let target = format!("/download?path={}", t.raw_path);
-    let mut resp = http_request(&t.host, t.port, "GET", &target, &headers)?;
+    let mut resp = http_request(&t.host, t.port, t.tls_fp.as_deref(), "GET", &target, &headers)?;
     if resp.status != 200 && resp.status != 206 {
         bail!("HTTP download failed: status {}", resp.status);
     }
@@ -903,7 +968,7 @@ fn http_download(t: &Target, part: &Path) -> Result<(u64, u64)> {
 /// the field is `null`).
 fn probe_fast_port(t: &Target) -> Result<Option<u16>> {
     let headers = auth_headers(t);
-    let mut resp = http_request(&t.host, t.port, "GET", "/api/capabilities", &headers)?;
+    let mut resp = http_request(&t.host, t.port, t.tls_fp.as_deref(), "GET", "/api/capabilities", &headers)?;
     if resp.status != 200 {
         return Ok(None);
     }
@@ -939,7 +1004,7 @@ fn auth_headers(t: &Target) -> Vec<(String, String)> {
 struct HttpResponse {
     status: u16,
     headers: Vec<(String, String)>,
-    reader: BufReader<TcpStream>,
+    reader: BufReader<Conn>,
     content_length: Option<u64>,
 }
 
@@ -951,34 +1016,31 @@ fn header<'a>(resp: &'a HttpResponse, name: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
-/// Perform a minimal plain-HTTP/1.1 request (`Connection: close`, one request per
-/// connection) and return the response with its body reader ready.
+/// Perform a minimal HTTP/1.1 request (`Connection: close`, one request per
+/// connection) over plain TCP or a pinned TLS session, returning the response
+/// with its body reader ready.
 fn http_request(
     host: &str,
     port: u16,
+    tls_fp: Option<&str>,
     method: &str,
     target: &str,
     extra: &[(String, String)],
 ) -> Result<HttpResponse> {
-    let stream = TcpStream::connect((host, port))
-        .with_context(|| format!("connecting to {host}:{port}"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(60))).ok();
+    let mut conn = connect(host, port, tls_fp)?;
 
     let mut req = format!("{method} {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
     for (k, v) in extra {
         req.push_str(&format!("{k}: {v}\r\n"));
     }
     req.push_str("\r\n");
-    {
-        let mut w = &stream;
-        w.write_all(req.as_bytes())?;
-        w.flush()?;
-    }
-    read_http_response(BufReader::new(stream))
+    conn.write_all(req.as_bytes())?;
+    conn.flush()?;
+    read_http_response(BufReader::new(conn))
 }
 
 /// Read a response's status line + headers, leaving the reader at the body start.
-fn read_http_response(mut reader: BufReader<TcpStream>) -> Result<HttpResponse> {
+fn read_http_response(mut reader: BufReader<Conn>) -> Result<HttpResponse> {
     let mut status_line = String::new();
     reader.read_line(&mut status_line)?;
     let status = parse_status(&status_line)?;
@@ -1054,7 +1116,7 @@ fn http_put(local: &Path, t: &Target, name: &str, total: u64, crc: Option<u32>) 
 /// `HEAD /upload?path=&name=` -> the bytes the server already holds.
 fn http_head_offset(t: &Target, enc_name: &str) -> Result<u64> {
     let target = format!("/upload?path=&name={enc_name}");
-    let resp = http_request(&t.host, t.port, "HEAD", &target, &auth_headers(t))?;
+    let resp = http_request(&t.host, t.port, t.tls_fp.as_deref(), "HEAD", &target, &auth_headers(t))?;
     Ok(header(&resp, "X-Zap-Offset").and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 
@@ -1067,9 +1129,7 @@ fn http_put_body(
     offset: u64,
     len: u64,
 ) -> Result<HttpResponse> {
-    let stream = TcpStream::connect((t.host.as_str(), t.port))
-        .with_context(|| format!("connecting to {}:{}", t.host, t.port))?;
-    stream.set_read_timeout(Some(Duration::from_secs(60))).ok();
+    let mut conn = connect(&t.host, t.port, t.tls_fp.as_deref())?;
 
     let mut req = format!(
         "PUT {target} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Length: {len}\r\n",
@@ -1079,25 +1139,22 @@ fn http_put_body(
         req.push_str(&format!("{k}: {v}\r\n"));
     }
     req.push_str("\r\n");
-    {
-        let mut w = &stream;
-        w.write_all(req.as_bytes())?;
-        let mut file = File::open(local)?;
-        file.seek(SeekFrom::Start(offset))?;
-        let mut remaining = len;
-        let mut buf = [0u8; CHUNK];
-        while remaining > 0 {
-            let want = remaining.min(buf.len() as u64) as usize;
-            let n = file.read(&mut buf[..want])?;
-            if n == 0 {
-                break;
-            }
-            w.write_all(&buf[..n])?;
-            remaining -= n as u64;
+    conn.write_all(req.as_bytes())?;
+    let mut file = File::open(local)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut remaining = len;
+    let mut buf = [0u8; CHUNK];
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        let n = file.read(&mut buf[..want])?;
+        if n == 0 {
+            break;
         }
-        w.flush()?;
+        conn.write_all(&buf[..n])?;
+        remaining -= n as u64;
     }
-    read_http_response(BufReader::new(stream))
+    conn.flush()?;
+    read_http_response(BufReader::new(conn))
 }
 
 /// Percent-encode a string for use as a URL query value (RFC 3986 unreserved set
@@ -1115,30 +1172,54 @@ fn percent_encode(s: &str) -> String {
 
 // ---- URL + destination parsing ----
 
-/// Parse a Zap download link. Must be `http://host[:port]/...?path=<file>` with
-/// an optional `&k=<token>`. HTTPS is rejected in v1 (plain HTTP only).
-fn parse_target(url: &str) -> Result<Target> {
-    let rest = url.strip_prefix("http://").ok_or_else(|| {
-        if url.starts_with("https://") {
-            anyhow!("`zap get` speaks plain HTTP only for now; open this https link in a browser instead")
-        } else {
-            anyhow!("expected an http:// URL, got: {url}")
-        }
-    })?;
+/// The connection-level parts common to any Zap link.
+struct UrlParts {
+    host: String,
+    port: u16,
+    token: Option<String>,
+    /// `Some(fingerprint)` for an `https://` link (TLS, pinned); `None` for plain.
+    tls_fp: Option<String>,
+    /// The raw (still percent-encoded) `?path=` value, if present.
+    raw_path: Option<String>,
+}
 
+/// Parse the scheme, authority, token, fingerprint, and path of a Zap link.
+/// `https://` requires a `&fp=` fingerprint to pin (there is no CA on the LAN).
+fn parse_url(url: &str) -> Result<UrlParts> {
+    let (tls, rest) = if let Some(r) = url.strip_prefix("https://") {
+        (true, r)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        (false, r)
+    } else {
+        bail!("expected an http:// or https:// URL, got: {url}");
+    };
     let (authority, pathq) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
     };
     let (host, port) = split_authority(authority);
-
     let (_, query) = super::split_query(pathq);
-    let raw_path = super::query_param(query, "path")
-        .map(|s| s.to_string())
+    let token = super::query_param(query, "k").map(super::decode_percent);
+    let fp = super::query_param(query, "fp").map(super::decode_percent);
+    let tls_fp = if tls {
+        Some(fp.ok_or_else(|| {
+            anyhow!("an https Zap link must include &fp=<fingerprint> to pin the certificate")
+        })?)
+    } else {
+        None
+    };
+    let raw_path = super::query_param(query, "path").map(|s| s.to_string());
+    Ok(UrlParts { host, port, token, tls_fp, raw_path })
+}
+
+/// Parse a Zap download link: `http(s)://host[:port]/...?path=<file>` with an
+/// optional `&k=<token>` (and, for https, a required `&fp=<fingerprint>`).
+fn parse_target(url: &str) -> Result<Target> {
+    let u = parse_url(url)?;
+    let raw_path = u
+        .raw_path
         .ok_or_else(|| anyhow!("the URL must include ?path=<file> (a Zap download link)"))?;
     let file_path = super::decode_percent(&raw_path);
-    let token = super::query_param(query, "k").map(super::decode_percent);
-
     let filename = file_path
         .rsplit('/')
         .find(|s| !s.is_empty())
@@ -1147,41 +1228,29 @@ fn parse_target(url: &str) -> Result<Target> {
     if filename.is_empty() {
         bail!("could not determine a filename from the URL");
     }
-
     Ok(Target {
-        host,
-        port,
+        host: u.host,
+        port: u.port,
         raw_path,
         file_path,
-        token,
+        token: u.token,
         filename,
+        tls_fp: u.tls_fp,
     })
 }
 
-/// Parse a Zap server URL for uploading: `http://host[:port]/[?k=<token>]`. No
+/// Parse a Zap server URL for uploading: `http(s)://host[:port]/[?k=<token>]`. No
 /// `?path=` is needed - the destination is `name` in the server's share root.
 fn parse_put_target(url: &str, name: &str) -> Result<Target> {
-    let rest = url.strip_prefix("http://").ok_or_else(|| {
-        if url.starts_with("https://") {
-            anyhow!("`zap put` speaks plain HTTP only for now; upload from the app instead")
-        } else {
-            anyhow!("expected an http:// URL, got: {url}")
-        }
-    })?;
-    let (authority, pathq) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
-    };
-    let (host, port) = split_authority(authority);
-    let (_, query) = super::split_query(pathq);
-    let token = super::query_param(query, "k").map(super::decode_percent);
+    let u = parse_url(url)?;
     Ok(Target {
-        host,
-        port,
+        host: u.host,
+        port: u.port,
         raw_path: name.to_string(),
         file_path: name.to_string(),
-        token,
+        token: u.token,
         filename: name.to_string(),
+        tls_fp: u.tls_fp,
     })
 }
 
@@ -1310,6 +1379,7 @@ mod tests {
             file_path: "f.bin".to_string(),
             token: None,
             filename: "f.bin".to_string(),
+            tls_fp: None,
         };
         let part = dst.join(".zap-part-f.bin");
 
@@ -1656,5 +1726,72 @@ mod tests {
         handle.stop();
         let _ = fs::remove_dir_all(&localdir);
         let _ = fs::remove_dir_all(&serverdir);
+    }
+
+    /// Encrypted end-to-end: against an HTTPS server, the fast lane runs under the
+    /// same pinned cert. A client pinning the right fingerprint downloads and
+    /// uploads byte-exact + verified; a client pinning the wrong fingerprint is
+    /// refused (the TLS handshake fails, so there is no fast lane and no HTTP
+    /// fallback either).
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_fast_lane_get_put_and_pinning() {
+        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let srv = std::env::temp_dir().join(format!("zap-tls-srv-{}", std::process::id()));
+        let local = std::env::temp_dir().join(format!("zap-tls-local-{}", std::process::id()));
+        let dst = std::env::temp_dir().join(format!("zap-tls-dst-{}", std::process::id()));
+        for d in [&srv, &local, &dst] {
+            let _ = fs::remove_dir_all(d);
+            fs::create_dir_all(d).unwrap();
+        }
+        let down = upload_payload(500_000);
+        let up = upload_payload(400_000);
+        fs::write(srv.join("down.bin"), &down).unwrap();
+        fs::write(local.join("up.bin"), &up).unwrap();
+
+        let material = crate::web::tls::self_signed(vec!["127.0.0.1".to_string(), "localhost".to_string()])
+            .expect("self-signed cert");
+        let fp = material.fingerprint.clone();
+        let port = free_port();
+        let (info, handle) = spawn(ServeConfig {
+            dir: srv.clone(),
+            port,
+            bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            auth: None,
+            history: None,
+            index_html: None,
+            tls: Some(material),
+        })
+        .expect("bind https");
+        assert_eq!(info.tls_fingerprint.as_deref(), Some(fp.as_str()));
+
+        // Download over the encrypted fast lane.
+        let get_url = format!("https://127.0.0.1:{port}/download?path=down.bin&fp={fp}");
+        let r = get_with(&get_url, &dst, GetOptions { streams: 4, chunk_size: 64 * 1024, adaptive: false })
+            .expect("tls fast get");
+        assert!(r.used_fast, "should use the (encrypted) fast lane");
+        assert!(r.verified, "CRC verified");
+        assert_eq!(fs::read(dst.join("down.bin")).unwrap(), down, "encrypted download byte-exact");
+
+        // Upload over the encrypted fast lane.
+        let put_url = format!("https://127.0.0.1:{port}/?fp={fp}");
+        let pr = put_with(&local.join("up.bin"), &put_url, None).expect("tls fast put");
+        assert!(pr.used_fast && pr.verified);
+        assert_eq!(fs::read(srv.join("up.bin")).unwrap(), up, "encrypted upload byte-exact");
+
+        // Wrong fingerprint: the pinned handshake fails, so the whole transfer
+        // errors (no downgrade to an unpinned connection).
+        let bad = std::env::temp_dir().join(format!("zap-tls-bad-{}", std::process::id()));
+        fs::create_dir_all(&bad).unwrap();
+        let bad_url = format!("https://127.0.0.1:{port}/download?path=down.bin&fp={}", "00".repeat(32));
+        assert!(
+            get_with(&bad_url, &bad, GetOptions::default()).is_err(),
+            "a wrong pinned fingerprint must be rejected"
+        );
+
+        handle.stop();
+        for d in [&srv, &local, &dst, &bad] {
+            let _ = fs::remove_dir_all(d);
+        }
     }
 }

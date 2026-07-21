@@ -29,6 +29,7 @@ fn run() -> Result<()> {
             secure,
             user,
             password,
+            tls,
         } => {
             let auth = if secure || user.is_some() || password.is_some() {
                 Some(Credentials {
@@ -39,6 +40,9 @@ fn run() -> Result<()> {
                 None
             };
             let login = auth.as_ref().map(|c| format!("{} / {}", c.user, c.pass));
+            // With --tls, generate a self-signed cert covering this host's LAN IP
+            // and localhost; the fast lane then runs encrypted under it.
+            let tls_material = if tls { build_serve_tls()? } else { None };
             web::serve(
                 ServeConfig {
                     dir: PathBuf::from(dir),
@@ -47,7 +51,7 @@ fn run() -> Result<()> {
                     auth,
                     history: None, // one-shot CLI: no persistent history
                     index_html: None,
-                    tls: None,
+                    tls: tls_material,
                 },
                 |info| {
                     print_banner(info);
@@ -152,6 +156,22 @@ fn cmd_put(local: &str, url: &str, name: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Generate the self-signed cert material for `zap serve --tls`, covering this
+/// host's LAN IP + localhost. Only available in a `--features tls` build.
+#[cfg(feature = "tls")]
+fn build_serve_tls() -> Result<Option<web::TlsMaterial>> {
+    let mut sans = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+    if let Some(ip) = web::lan_ip() {
+        sans.push(ip.to_string());
+    }
+    Ok(Some(web::tls::self_signed(sans)?))
+}
+
+#[cfg(not(feature = "tls"))]
+fn build_serve_tls() -> Result<Option<web::TlsMaterial>> {
+    anyhow::bail!("this `zap` build has no TLS support; rebuild with `--features tls` to use --tls")
+}
+
 fn build_transport(kind: TransportKind) -> Result<Box<dyn Transport>> {
     Ok(match kind {
         TransportKind::Adb => Box::new(AdbTransport::locate()?),
@@ -232,6 +252,11 @@ fn print_banner(info: &ServerInfo) {
             }
             if info.auth_token.is_some() {
                 println!("(Scanning the QR signs in automatically - no password typing.)");
+            }
+            // The full link carries the pairing key and (under TLS) the cert
+            // fingerprint - what `zap get`/`zap put` on another device need.
+            if info.auth_token.is_some() || info.tls_fingerprint.is_some() {
+                println!("\nApp-to-app link: {}", info.url_with_key());
             }
         }
         None => {

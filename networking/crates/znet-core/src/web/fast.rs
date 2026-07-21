@@ -55,6 +55,8 @@ const CHUNK: usize = 128 * 1024;
 pub(crate) struct FastHandle {
     /// The OS-assigned port the listener bound to (advertised in capabilities).
     pub(crate) port: u16,
+    /// Whether the listener speaks TLS (advertised in capabilities).
+    pub(crate) tls: bool,
     stop: Arc<AtomicBool>,
     local_addr: SocketAddr,
     acceptor: Option<thread::JoinHandle<()>>,
@@ -120,6 +122,7 @@ pub(crate) fn spawn_listener(
     let listener = TcpListener::bind(SocketAddr::new(bind, 0))?;
     let local_addr = listener.local_addr()?;
     let port = local_addr.port();
+    let is_tls = tls.is_some();
     let stop = Arc::new(AtomicBool::new(false));
 
     let acceptor = {
@@ -157,6 +160,7 @@ pub(crate) fn spawn_listener(
 
     Ok(FastHandle {
         port,
+        tls: is_tls,
         stop,
         local_addr,
         acceptor: Some(acceptor),

@@ -111,5 +111,10 @@ pub enum Command {
         /// Password for the login (implies --secure).
         #[arg(long)]
         password: Option<String>,
+        /// Serve over HTTPS with a self-signed cert (and run the fast lane
+        /// encrypted under it). Native clients pin the cert fingerprint from the
+        /// share link; browsers see a one-time self-signed warning.
+        #[arg(long)]
+        tls: bool,
     },
 }

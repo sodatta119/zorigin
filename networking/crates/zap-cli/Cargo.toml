@@ -9,6 +9,13 @@ description = "Command-line interface for zap (macOS/desktop)"
 name = "zap"
 path = "src/main.rs"
 
+[features]
+# Off by default so the shipped CLI (and, via Cargo feature unification, the
+# desktop build) stay lean and plain-HTTP-first. Build with `--features tls` to
+# get the encrypted fast lane + HTTPS control channel: `zap serve --tls`, and
+# https:// download/upload links with cert-fingerprint pinning.
+tls = ["znet-core/tls"]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true

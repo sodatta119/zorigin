@@ -39,6 +39,8 @@ handshake, one reply, then (on success) the requested byte range.
 
 ## 3. Handshake (client -> server)
 
+Common prefix (both ops):
+
 ```
 offset  size  field
 0       4     magic          = b"ZAPX" (0x5A 0x41 0x50 0x58)
@@ -50,12 +52,24 @@ offset  size  field
 9+N     4     path_len       u32
 ..      M     path           UTF-8, the file path relative to the share root
                              (same value the HTTP path uses as ?path=)
+```
+
+For **GET** (`op = 1`), the prefix is followed by:
+
+```
 ..      8     offset         u64  resume point; first byte of the range to send
 ..      8     range_len      u64  bytes to send from `offset`; 0 = to EOF
 ```
 
-`op = 2` (PUT/upload) is reserved for a later phase; v1 servers reply with an
-error for it.
+For **PUT** (`op = 2`), the prefix is followed by:
+
+```
+..      8     offset         u64  client's known offset (informational; the server
+                             replies with the authoritative resume offset)
+..      8     total          u64  whole-file size the client will upload
+..      1     has_crc        u8   (1 = a whole-file CRC follows)
+..      4     crc32          u32  IEEE/zlib CRC-32 of the whole file (if has_crc)
+```
 
 ## 4. Handshake reply (server -> client)
 
@@ -64,7 +78,7 @@ offset  size  field
 0       1     status         u8  (0 = OK, non-zero = error, see below)
 ```
 
-On **OK** (`status = 0`):
+On a **GET OK** (`status = 0`):
 
 ```
 1       8     total_size     u64  whole-file size in bytes
@@ -90,6 +104,20 @@ the whole-file CRC-32 per `(path, size, mtime)`. Without it, every one of a
 multi-stream download's handshakes would re-read the whole file to compute the
 CRC. The first request (normally the stat) computes it; the rest reuse it.
 
+On a **PUT OK** (`status = 0`):
+
+```
+1       8     offset         u64  the authoritative resume offset - how many
+                             bytes the server already holds. The client seeks its
+                             local file here and streams [offset, total).
+```
+
+The client then writes the raw bytes `[offset, total)`. When the server has the
+whole file it verifies the CRC, atomically renames the temp file into place, and
+sends a single **final status** byte: `0` = ok/verified, `6` = integrity failure,
+`5` = other server error. A dropped connection mid-upload leaves the temp file for
+the client to resume (re-handshake -> new authoritative offset).
+
 On **error** (`status != 0`):
 
 ```
@@ -105,8 +133,9 @@ On **error** (`status != 0`):
 | 1 | bad request (bad magic / unsupported version / malformed handshake) |
 | 2 | unauthorized (token required and did not match) |
 | 3 | not found (path does not resolve to a readable file) |
-| 4 | unsupported op (e.g. PUT in v1) |
+| 4 | unsupported op |
 | 5 | server error |
+| 6 | integrity check failed (upload CRC mismatch) |
 
 ## 5. Auth + TLS
 
@@ -114,11 +143,15 @@ On **error** (`status != 0`):
   `token` must equal the server's session token, byte for byte. Mismatch or empty
   -> status 2 and the connection closes. When the server is open, `token` is
   ignored. This is the same token the HTTP `?k=` / `zap_session` cookie uses.
-- **TLS:** in v1 the listener is plain TCP and is only advertised when the HTTP
-  server is plain (see §1). A later phase runs the listener under the same
-  self-signed rustls cert as HTTPS; native clients pin the fingerprint they
-  already learned from the QR/pairing (`&fp=` in the share URL). `tls` in
-  `/api/capabilities` reflects which mode is active.
+- **TLS (implemented, feature `tls`):** when the HTTP server is HTTPS, the fast
+  lane runs under the **same** self-signed rustls cert, and `/api/capabilities`
+  reports `tls:true`. A native client pins the cert by the SHA-256 fingerprint it
+  learned from the pairing link (`&fp=` in the share URL) - there is no CA on the
+  LAN, so fingerprint pinning is the trust primitive; a wrong fingerprint fails
+  the handshake and the transfer is refused (no downgrade). The control channel
+  (`/api/capabilities`, HTTP fallback) uses the same pinned TLS. When the HTTP
+  server is plain, the fast lane is plain TCP, token-authed, and `tls:false` - the
+  fast lane is never run plain alongside an HTTPS server.
 
 ## 6. Integrity + resume (mirror the HTTP path)
 
@@ -127,6 +160,13 @@ On **error** (`status != 0`):
   and (if `has_crc`) the whole-file CRC-32 before an atomic rename into place. A
   partial file is never exposed as complete - the same rule the HTTP path
   enforces.
+- **Uploads (PUT):** the server appends into `.zap-part-<name>` from the
+  authoritative offset it reports, verifies the client-supplied whole-file CRC-32
+  once the temp file reaches `total`, then atomically renames into place - byte
+  for byte the same resumable-upload semantics as the HTTP `PUT /upload` path,
+  reusing the same temp file and coalesced transfer row. The HTTP fallback for
+  uploads is the browser's resumable upload (`HEAD` for the offset, then `PUT`
+  with `X-Zap-Total` / `X-Zap-Crc32`).
 - **Resume across drops:** the temp file's size on disk is the checkpoint. On a
   dropped connection the client re-handshakes with `offset` = current temp-file
   size and continues. Identical model to the HTTP resumable download/upload.

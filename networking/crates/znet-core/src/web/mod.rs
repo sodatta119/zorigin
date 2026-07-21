@@ -28,6 +28,8 @@ mod clips;
 mod events;
 mod fast;
 pub mod fast_client;
+#[cfg(feature = "tls")]
+mod fast_tls;
 pub use clips::{Clip, ClipStore};
 pub use events::{Event, EventHub};
 
@@ -462,37 +464,65 @@ pub fn serve(config: ServeConfig, on_ready: impl FnOnce(&ServerInfo)) -> Result<
     let hub = EventHub::new();
     let clips = Arc::new(ClipStore::new());
     let index = index_of(&config);
-    // Start the optional native-to-native fast lane and advertise its port via
+    // Start the optional native-to-native fast lane and advertise it via
     // /api/capabilities. Held in `fast` for the server's lifetime.
     let fast = start_fast(&config, &dir, &auth, &stats);
-    let fast_port = fast.as_ref().map(|h| h.port);
+    let fast_advert = fast.as_ref().map(|h| (h.port, h.tls));
     // Use the calling thread as the acceptor; blocks until the process exits.
-    accept_loop(&server, &dir, &auth, &stats, &hub, &clips, &index, fast_port);
+    accept_loop(&server, &dir, &auth, &stats, &hub, &clips, &index, fast_advert);
     drop(fast);
     Ok(())
 }
 
-/// Start the fast-lane listener when appropriate, returning its handle. Returns
-/// `None` when the fast lane should not run: currently whenever HTTPS is on (v1's
-/// fast lane is plain TCP, so it is only advertised on plain-HTTP servers - no
-/// silent downgrade), or if the listener fails to bind (then native clients just
-/// use HTTP). Fast-lane TLS in a later phase will let it run under HTTPS too.
+/// Start the fast-lane listener when appropriate, returning its handle. When the
+/// HTTP server is HTTPS the fast lane runs under the **same** rustls cert (or not
+/// at all - never a plain downgrade alongside HTTPS); when HTTP is plain the fast
+/// lane is plain TCP, token-authed. `None` also when the listener fails to bind
+/// (native clients then just use HTTP).
 fn start_fast(
     config: &ServeConfig,
     dir: &Arc<PathBuf>,
     auth: &Arc<Option<Auth>>,
     stats: &Arc<Stats>,
 ) -> Option<fast::FastHandle> {
-    if config.tls.is_some() {
-        return None;
-    }
-    match fast::spawn_listener(config.bind, Arc::clone(dir), Arc::clone(auth), Arc::clone(stats), None) {
+    let tls_cfg = if config.tls.is_some() {
+        // Encrypted server: the fast lane must run under the same cert, or not run
+        // at all. If we cannot build the TLS config, skip the fast lane rather
+        // than expose a plain listener next to an HTTPS server.
+        match build_fast_tls(config) {
+            Some(cfg) => Some(cfg),
+            None => return None,
+        }
+    } else {
+        None
+    };
+    match fast::spawn_listener(config.bind, Arc::clone(dir), Arc::clone(auth), Arc::clone(stats), tls_cfg) {
         Ok(h) => Some(h),
         Err(e) => {
             eprintln!("zap: fast lane unavailable ({e}); native clients will use HTTP");
             None
         }
     }
+}
+
+/// Build the fast-lane TLS server config from the run's cert material, if any.
+#[cfg(feature = "tls")]
+fn build_fast_tls(config: &ServeConfig) -> Option<fast::FastServerTls> {
+    let material = config.tls.as_ref()?;
+    match fast_tls::server_config(material) {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            eprintln!("zap: fast-lane TLS unavailable ({e}); fast lane will not run");
+            None
+        }
+    }
+}
+
+/// Without the `tls` feature there is no fast-lane TLS (and the HTTPS server
+/// itself cannot bind, so this is never reached with `config.tls` set).
+#[cfg(not(feature = "tls"))]
+fn build_fast_tls(_config: &ServeConfig) -> Option<fast::FastServerTls> {
+    None
 }
 
 /// The SPA to serve at `/`: the app's override if given, else the built-in Zap UI.
@@ -517,7 +547,7 @@ pub fn spawn(config: ServeConfig) -> Result<(ServerInfo, ServerHandle)> {
     let clips = Arc::new(ClipStore::new());
     let index = index_of(&config);
     let fast = start_fast(&config, &dir, &auth, &stats);
-    let fast_port = fast.as_ref().map(|h| h.port);
+    let fast_advert = fast.as_ref().map(|h| (h.port, h.tls));
     let acceptor = {
         let server = Arc::clone(&server);
         let dir = Arc::clone(&dir);
@@ -527,7 +557,7 @@ pub fn spawn(config: ServeConfig) -> Result<(ServerInfo, ServerHandle)> {
         let clips = Arc::clone(&clips);
         let index = Arc::clone(&index);
         thread::spawn(move || {
-            accept_loop(&server, &dir, &auth, &stats, &hub, &clips, &index, fast_port)
+            accept_loop(&server, &dir, &auth, &stats, &hub, &clips, &index, fast_advert)
         })
     };
     Ok((
@@ -620,7 +650,7 @@ fn accept_loop(
     hub: &EventHub,
     clips: &Arc<ClipStore>,
     index: &Arc<str>,
-    fast_port: Option<u16>,
+    fast_advert: Option<(u16, bool)>,
 ) {
     for request in server.incoming_requests() {
         // A request arriving at all proves a client reached this host.
@@ -633,7 +663,7 @@ fn accept_loop(
         let index = Arc::clone(index);
         thread::spawn(move || {
             if let Err(e) =
-                handle(request, &dir, (*auth).as_ref(), &stats, &hub, &clips, &index, fast_port)
+                handle(request, &dir, (*auth).as_ref(), &stats, &hub, &clips, &index, fast_advert)
             {
                 eprintln!("zap: request error: {e:#}");
             }
@@ -649,7 +679,7 @@ fn handle(
     hub: &EventHub,
     clips: &Arc<ClipStore>,
     index: &str,
-    fast_port: Option<u16>,
+    fast_advert: Option<(u16, bool)>,
 ) -> Result<()> {
     let method = request.method().clone();
     let raw_url = request.url().to_string();
@@ -704,7 +734,7 @@ fn handle(
         // client reads the advertised port here, then connects to the fast lane
         // (falling back to HTTP if it is absent or unreachable).
         (Method::Get, "/api/capabilities") => {
-            respond(request, json_response(&capabilities_json(fast_port)))
+            respond(request, json_response(&capabilities_json(fast_advert)))
         }
         (Method::Get, "/api/list") => {
             let rel = query_param(query, "path").map(decode_percent).unwrap_or_default();
@@ -749,15 +779,13 @@ fn handle(
     }
 }
 
-/// The `GET /api/capabilities` body. Advertises the fast lane when it is
-/// running (`fast_port` set), else `fast:null`. `tls` is always `false` in v1
-/// because the listener is only started on plain-HTTP servers (see
-/// [`start_fast`]); a later phase runs it under the shared cert and reports the
-/// real value here.
-fn capabilities_json(fast_port: Option<u16>) -> String {
-    match fast_port {
-        Some(port) => format!(
-            "{{\"fast\":{{\"port\":{port},\"tls\":false,\"version\":{}}}}}",
+/// The `GET /api/capabilities` body. Advertises the fast lane when it is running
+/// (`Some((port, tls))`), else `fast:null`. `tls` reflects whether the listener
+/// itself is encrypted (true under an HTTPS server, false on a plain one).
+fn capabilities_json(fast_advert: Option<(u16, bool)>) -> String {
+    match fast_advert {
+        Some((port, tls)) => format!(
+            "{{\"fast\":{{\"port\":{port},\"tls\":{tls},\"version\":{}}}}}",
             fast::VERSION
         ),
         None => "{\"fast\":null}".to_string(),
@@ -2806,14 +2834,16 @@ mod tests {
         st[0]
     }
 
-    /// `capabilities_json` reports the fast-lane port when running, else null.
+    /// `capabilities_json` reports the fast-lane port + tls flag, else null.
     #[test]
     fn capabilities_json_reports_port_or_null() {
         assert_eq!(capabilities_json(None), "{\"fast\":null}");
-        let s = capabilities_json(Some(41234));
-        assert!(s.contains("\"port\":41234"), "port advertised: {s}");
-        assert!(s.contains("\"tls\":false"), "plain in v1: {s}");
-        assert!(s.contains("\"version\":1"), "version present: {s}");
+        let plain = capabilities_json(Some((41234, false)));
+        assert!(plain.contains("\"port\":41234"), "port advertised: {plain}");
+        assert!(plain.contains("\"tls\":false"), "plain server: {plain}");
+        assert!(plain.contains("\"version\":1"), "version present: {plain}");
+        let secure = capabilities_json(Some((5555, true)));
+        assert!(secure.contains("\"tls\":true"), "encrypted server: {secure}");
     }
 
     /// The fast lane must not run (or be advertised) while HTTPS is on, so an
