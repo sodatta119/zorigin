@@ -22,12 +22,15 @@
 //! running server; `nativeStop` frees it and shuts the server down.
 
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 use jni::objects::{JClass, JString};
 use jni::sys::{jint, jlong, jstring};
 use jni::JNIEnv;
 
+use znet_core::web::fast_client::{self, GetOptions, Progress, Report};
 use znet_core::web::{self, Credentials, Direction, ServeConfig, ServerHandle, ServerInfo};
 
 /// Owns a running server plus its connection details, boxed and handed to Kotlin
@@ -254,6 +257,111 @@ fn json_string(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+// ---- Native fast-lane client (Receive): download from another Zap ----
+
+/// A background download started by [`nativeGet`]. The Rust worker thread runs
+/// the blocking fast-lane client (with HTTP fallback) and posts its result into
+/// `done`; Kotlin polls [`nativeGetStatus`] for the progress bar + completion.
+struct GetJob {
+    progress: Arc<Progress>,
+    done: Arc<Mutex<Option<std::result::Result<Report, String>>>>,
+}
+
+/// Start downloading `url` into `dest_dir` over the fast lane (HTTP fallback).
+/// Returns an opaque handle for [`nativeGetStatus`] / [`nativeGetFree`], or 0 if
+/// the arguments couldn't be read.
+#[no_mangle]
+pub extern "system" fn Java_com_zap_transfer_NativeBridge_nativeGet<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    url: JString<'local>,
+    dest_dir: JString<'local>,
+) -> jlong {
+    let url: String = match env.get_string(&url) {
+        Ok(s) => s.into(),
+        Err(_) => return 0,
+    };
+    let dest: String = match env.get_string(&dest_dir) {
+        Ok(s) => s.into(),
+        Err(_) => return 0,
+    };
+
+    let progress = Arc::new(Progress::default());
+    let done = Arc::new(Mutex::new(None));
+    let job = Box::new(GetJob {
+        progress: Arc::clone(&progress),
+        done: Arc::clone(&done),
+    });
+    std::thread::spawn(move || {
+        let out = fast_client::get_with_progress(&url, Path::new(&dest), GetOptions::default(), progress)
+            .map_err(|e| format!("{e:#}"));
+        if let Ok(mut slot) = done.lock() {
+            *slot = Some(out);
+        }
+    });
+    Box::into_raw(job) as jlong
+}
+
+/// Poll a download's status as JSON:
+/// `{"done","total","running","ok","fast","verified","name","error"}`.
+#[no_mangle]
+pub extern "system" fn Java_com_zap_transfer_NativeBridge_nativeGetStatus<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jstring {
+    let json = if handle == 0 {
+        "{\"running\":false,\"ok\":false,\"error\":\"bad handle\"}".to_string()
+    } else {
+        // Safety: `handle` came from `nativeGet` and is not yet freed.
+        let job = unsafe { &*(handle as *const GetJob) };
+        let done = job.progress.done.load(Ordering::Relaxed);
+        let total = job.progress.total.load(Ordering::Relaxed);
+        let finished = job.done.lock().ok().map(|s| s.is_some()).unwrap_or(false);
+        if !finished {
+            format!("{{\"running\":true,\"done\":{done},\"total\":{total}}}")
+        } else {
+            match job.done.lock().ok().and_then(|s| s.clone()) {
+                Some(Ok(r)) => {
+                    let name = r
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    format!(
+                        "{{\"running\":false,\"ok\":true,\"done\":{},\"total\":{},\"fast\":{},\"verified\":{},\"name\":{}}}",
+                        r.total, r.total, r.used_fast, r.verified, json_string(&name)
+                    )
+                }
+                Some(Err(e)) => {
+                    format!("{{\"running\":false,\"ok\":false,\"error\":{}}}", json_string(&e))
+                }
+                None => "{\"running\":true}".to_string(),
+            }
+        }
+    };
+    match env.new_string(json) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Free a download handle from [`nativeGet`]. Safe with 0 (no-op).
+#[no_mangle]
+pub extern "system" fn Java_com_zap_transfer_NativeBridge_nativeGetFree(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) {
+    if handle == 0 {
+        return;
+    }
+    // Safety: `handle` came from `nativeGet` and is freed exactly once here.
+    unsafe {
+        drop(Box::from_raw(handle as *mut GetJob));
+    }
 }
 
 /// Stop the server and free the handle. Safe to call with 0 (no-op).

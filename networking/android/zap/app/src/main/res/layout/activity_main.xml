@@ -85,6 +85,18 @@
                 android:textAllCaps="false"
                 android:textSize="15sp"
                 android:text="Transfers" />
+
+            <Button
+                android:id="@+id/tabReceive"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="12dp"
+                android:background="@android:color/transparent"
+                android:minWidth="0dp"
+                android:paddingHorizontal="6dp"
+                android:textAllCaps="false"
+                android:textSize="15sp"
+                android:text="Receive" />
         </LinearLayout>
 
         <!-- Share view (status + settings + folder) -->

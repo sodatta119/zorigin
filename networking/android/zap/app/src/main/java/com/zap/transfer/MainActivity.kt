@@ -1,6 +1,7 @@
 package com.zap.transfer
 
 import android.Manifest
+import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -20,10 +21,12 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
+import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import org.json.JSONArray
+import org.json.JSONObject
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -56,6 +59,8 @@ class MainActivity : AppCompatActivity() {
     private var transfersTab = false
     private val handler = Handler(Looper.getMainLooper())
     private var polling = false
+    /// Native handle of an in-flight Receive download (0 when idle).
+    private var receiveHandle: Long = 0
     private data class Sample(var t: Long, var done: Long, var speed: Double)
     private val speeds = HashMap<Long, Sample>()
     private data class Xfer(val id: Long, val name: String, val path: String, val dir: String, val done: Long, val total: Long?, val finished: Boolean, val ok: Boolean, val verified: Boolean, val fast: Boolean)
@@ -126,6 +131,7 @@ class MainActivity : AppCompatActivity() {
         transfersView = findViewById(R.id.transfersView)
         tabShare.setOnClickListener { transfersTab = false; render() }
         tabTransfers.setOnClickListener { transfersTab = true; render() }
+        findViewById<Button>(R.id.tabReceive).setOnClickListener { showReceiveDialog() }
         if (intent?.getStringExtra("zap_tab") == "transfers") transfersTab = true
 
         // Restore saved security settings.
@@ -555,6 +561,101 @@ class MainActivity : AppCompatActivity() {
             data = Uri.parse("package:$packageName")
         }
         startActivity(intent)
+    }
+
+    // ---- Receive: pull a file from another Zap over the fast lane ----
+
+    /// Prompt for a Zap download link and pull it into the current folder over
+    /// the fast lane (HTTP fallback), showing live progress in the dialog.
+    private fun showReceiveDialog() {
+        val input = EditText(this).apply {
+            hint = "Paste a Zap download link"
+            setSingleLine(true)
+        }
+        val status = TextView(this).apply {
+            text = "Saves into: ${folderLabel(currentFolder())}"
+            setPadding(0, 24, 0, 0)
+        }
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(56, 24, 56, 0)
+            addView(input)
+            addView(status)
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Receive a file")
+            .setView(container)
+            .setPositiveButton("Download", null) // wired below to avoid auto-dismiss
+            .setNegativeButton("Close", null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val url = input.text.toString().trim()
+                if (url.isEmpty()) {
+                    status.text = "Paste a link first."
+                } else {
+                    startReceive(url, status)
+                }
+            }
+        }
+        dialog.setOnDismissListener {
+            if (receiveHandle != 0L) {
+                NativeBridge.nativeGetFree(receiveHandle)
+                receiveHandle = 0
+            }
+        }
+        dialog.show()
+    }
+
+    private fun startReceive(url: String, status: TextView) {
+        if (receiveHandle != 0L) return // one download at a time
+        receiveHandle = NativeBridge.nativeGet(url, currentFolder())
+        if (receiveHandle == 0L) {
+            status.text = "Couldn't start - check the link."
+            return
+        }
+        status.text = "Starting…"
+        pollReceive(status)
+    }
+
+    private fun pollReceive(status: TextView) {
+        val h = receiveHandle
+        if (h == 0L) return
+        val json = NativeBridge.nativeGetStatus(h)
+        try {
+            val o = JSONObject(json ?: "{}")
+            when {
+                o.optBoolean("running", false) -> {
+                    val done = o.optLong("done", 0)
+                    val total = o.optLong("total", 0)
+                    status.text = if (total > 0) {
+                        val pct = (done.toDouble() / total * 100).coerceIn(0.0, 100.0).toInt()
+                        "Downloading… ${humanBytes(done)} / ${humanBytes(total)} ($pct%)"
+                    } else {
+                        "Connecting…"
+                    }
+                    handler.postDelayed({ pollReceive(status) }, 300)
+                }
+                o.optBoolean("ok", false) -> {
+                    val name = o.optString("name", "file")
+                    val fast = if (o.optBoolean("fast", false)) " · ⚡ direct" else ""
+                    val verified = if (o.optBoolean("verified", false)) " · verified" else ""
+                    status.text = "✓ Saved $name$fast$verified"
+                    NativeBridge.nativeGetFree(h)
+                    receiveHandle = 0
+                    refreshTransfers()
+                }
+                else -> {
+                    status.text = "Failed: ${o.optString("error", "unknown error")}"
+                    NativeBridge.nativeGetFree(h)
+                    receiveHandle = 0
+                }
+            }
+        } catch (e: Exception) {
+            status.text = "Error: ${e.message}"
+            NativeBridge.nativeGetFree(h)
+            receiveHandle = 0
+        }
     }
 
     companion object {

@@ -43,6 +43,21 @@ object NativeBridge {
 
     /** Stop the server and release the handle. Safe to call with 0. */
     external fun nativeStop(handle: Long)
+
+    // ---- Native fast-lane client (Receive): download from another Zap ----
+
+    /**
+     * Start downloading [url] (a Zap download link) into [destDir] over the
+     * native fast lane, falling back to HTTP. Returns an opaque job handle for
+     * [nativeGetStatus] / [nativeGetFree], or 0 on a bad argument.
+     */
+    external fun nativeGet(url: String, destDir: String): Long
+
+    /** Poll a download's status as a JSON string (see Rust doc). */
+    external fun nativeGetStatus(handle: Long): String?
+
+    /** Free a download job handle from [nativeGet]. Safe with 0. */
+    external fun nativeGetFree(handle: Long)
 }
 
 /**
