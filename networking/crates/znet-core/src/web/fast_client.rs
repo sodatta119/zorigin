@@ -210,38 +210,54 @@ type Range = (u64, u64);
 /// read pass over the assembled file.
 type Done = (u64, u64, u32);
 
-/// Dynamic work allocator: hands out ranges from a moving cursor at the current
-/// (adaptive) chunk size, tracks completed ranges (for the resume prefix), and
-/// holds failed ranges for retry. Guarded by one mutex in [`Shared`].
+/// Dynamic work allocator: hands out `chunk_size` slices from a list of gaps
+/// (the byte ranges still to download), tracks completed ranges (for the resume
+/// prefix + CRC combine), and holds failed ranges for retry. Guarded by one mutex
+/// in [`Shared`]. Completed ranges are also appended to a crash-resume manifest.
 struct Alloc {
     start: u64,
-    cursor: u64,
     total: u64,
     chunk_size: u64,
+    /// Byte ranges still to hand out (gaps). One entry `[start,total)` for a
+    /// fresh/contiguous download; the complement of the completed set when
+    /// resuming a holey file from a manifest.
+    todo: Vec<Range>,
     reclaim: Vec<Range>,
     completed: Vec<Done>,
     attempts: HashMap<u64, u32>,
+    /// Append-only crash-resume manifest (`.zmeta`), if one could be opened.
+    manifest: Option<File>,
 }
 
 impl Alloc {
     /// Claim the next range: a failed range to retry if any, else a fresh
-    /// `chunk_size` slice from the cursor. `None` when nothing is left to hand
+    /// `chunk_size` slice off the front gap. `None` when nothing is left to hand
     /// out (work may still be in flight in other workers).
     fn claim(&mut self) -> Option<Range> {
         if let Some(r) = self.reclaim.pop() {
             return Some(r);
         }
-        if self.cursor < self.total {
-            let len = self.chunk_size.min(self.total - self.cursor);
-            let r = (self.cursor, len);
-            self.cursor += len;
-            return Some(r);
+        if let Some(gap) = self.todo.first_mut() {
+            let (off, len) = *gap;
+            let take = self.chunk_size.min(len);
+            if take == len {
+                self.todo.remove(0);
+            } else {
+                gap.0 += take;
+                gap.1 -= take;
+            }
+            return Some((off, take));
         }
         None
     }
 
     fn complete(&mut self, r: Range, crc: u32) {
         self.completed.push((r.0, r.1, crc));
+        // Best-effort append to the crash-resume manifest (no fsync: an OS page
+        // cache survives a process kill, which is the case we resume from).
+        if let Some(f) = self.manifest.as_mut() {
+            let _ = f.write_all(format!("r\t{}\t{}\t{}\n", r.0, r.1, crc).as_bytes());
+        }
     }
 
     /// Record a failed range. Returns true if it has failed too many times (the
@@ -259,12 +275,12 @@ impl Alloc {
 
     /// True once every byte has been handed out and completed.
     fn all_done(&self) -> bool {
-        self.reclaim.is_empty() && self.cursor >= self.total && self.contiguous_prefix() >= self.total
+        self.reclaim.is_empty() && self.todo.is_empty() && self.contiguous_prefix() >= self.total
     }
 
     /// True while there is still work to hand out (fresh or reclaimed).
     fn work_remaining(&self) -> bool {
-        !self.reclaim.is_empty() || self.cursor < self.total
+        !self.reclaim.is_empty() || !self.todo.is_empty()
     }
 
     /// The length of the contiguous, gap-free prefix of completed ranges from
@@ -327,18 +343,35 @@ fn fast_download(
     progress: &Arc<Progress>,
 ) -> Result<(u64, bool, u64, usize)> {
     let (total, crc) = fast_stat(t, fast_port)?;
+    let mpath = manifest_path(part);
+    let disk_len = fs::metadata(part).map(|m| m.len()).unwrap_or(0);
 
-    // The on-disk temp file is always a contiguous prefix (we truncate to one on
-    // any failure), so its length is a valid resume offset.
-    let mut start = fs::metadata(part).map(|m| m.len()).unwrap_or(0);
-    if start > total {
-        start = 0;
-    }
+    // Resume strategy:
+    //  - Manifest (hard-kill) resume: the temp file is already full size (holey)
+    //    and a matching .zmeta records which ranges are good -> download the gaps.
+    //  - Contiguous resume (graceful drop / prior run): the on-disk length is a
+    //    valid resume offset (we always truncate to a contiguous prefix on a soft
+    //    failure) -> download [len, total).
+    let seed: Vec<Done> = if disk_len == total && total > 0 {
+        load_manifest(&mpath, total)
+    } else {
+        Vec::new()
+    };
+    let resuming = !seed.is_empty();
+    let (start, resumed_from, todo, completed): (u64, u64, Vec<Range>, Vec<Done>) = if resuming {
+        let have: u64 = seed.iter().map(|(_, len, _)| *len).sum();
+        (0, have, gaps(total, &seed), seed)
+    } else {
+        let s = if disk_len > total { 0 } else { disk_len };
+        let todo = if total > s { vec![(s, total - s)] } else { Vec::new() };
+        (s, s, todo, Vec::new())
+    };
+
     progress.total.store(total, Ordering::Relaxed);
-    progress.done.store(start, Ordering::Relaxed);
+    progress.done.store(resumed_from, Ordering::Relaxed);
 
     // Pre-size to the full length so workers can write ranges at absolute offsets;
-    // the existing [0, start) prefix is preserved, the rest zero-filled.
+    // existing bytes are preserved, the rest zero-filled.
     {
         let file = OpenOptions::new()
             .create(true)
@@ -348,13 +381,16 @@ fn fast_download(
         file.set_len(total)?;
     }
 
-    if start == total {
+    // Nothing to fetch and nothing seeded -> the file is (claimed) complete; verify.
+    if todo.is_empty() && completed.is_empty() {
         let verified = verify_crc(part, crc)?;
         if crc.is_some() && !verified {
             let _ = fs::remove_file(part);
+            let _ = fs::remove_file(&mpath);
             bail!("integrity check failed (CRC mismatch)");
         }
-        return Ok((total, verified, start, 0));
+        let _ = fs::remove_file(&mpath);
+        return Ok((total, verified, resumed_from, 0));
     }
 
     let max_streams = opts.streams.max(1);
@@ -372,12 +408,13 @@ fn fast_download(
     let shared = Arc::new(Shared {
         alloc: Mutex::new(Alloc {
             start,
-            cursor: start,
             total,
             chunk_size: init_chunk,
+            todo,
             reclaim: Vec::new(),
-            completed: Vec::new(),
+            completed,
             attempts: HashMap::new(),
+            manifest: open_manifest(&mpath, total, resuming),
         }),
         part: part.to_path_buf(),
         bytes: AtomicU64::new(0),
@@ -395,10 +432,13 @@ fn fast_download(
 
     let all_done = lock(&shared.alloc).all_done();
     if !all_done {
+        // Truncate to a contiguous prefix so HTTP fallback / the next run resumes
+        // cleanly, and drop the now-invalid manifest.
         let prefix = lock(&shared.alloc).contiguous_prefix();
         if let Ok(file) = OpenOptions::new().write(true).open(part) {
             let _ = file.set_len(prefix);
         }
+        let _ = fs::remove_file(&mpath);
         bail!("fast lane incomplete after retries (contiguous prefix {prefix}/{total})");
     }
 
@@ -411,8 +451,8 @@ fn fast_download(
     // prefix [0, start) is read. Fall back to a full re-read if that can't be
     // reconstructed for any reason.
     let verified = if let Some(want) = crc {
-        let mut completed = lock(&shared.alloc).completed.clone();
-        let got_crc = match combined_crc(part, start, &mut completed) {
+        let mut done = lock(&shared.alloc).completed.clone();
+        let got_crc = match combined_crc(part, start, &mut done) {
             Ok(v) => v,
             Err(_) => crc32_file(part).map_err(|e| anyhow!("reading for CRC: {e}"))?,
         };
@@ -422,10 +462,83 @@ fn fast_download(
     };
     if crc.is_some() && !verified {
         let _ = fs::remove_file(part);
+        let _ = fs::remove_file(&mpath);
         bail!("integrity check failed (CRC mismatch)");
     }
+    let _ = fs::remove_file(&mpath); // complete + verified: manifest no longer needed
     let peak = shared.peak.load(Ordering::SeqCst).max(1);
-    Ok((total, verified, start, peak))
+    Ok((total, verified, resumed_from, peak))
+}
+
+/// Path of the crash-resume manifest sidecar for a `.zap-part-` temp file.
+fn manifest_path(part: &Path) -> PathBuf {
+    let mut s = part.as_os_str().to_os_string();
+    s.push(".zmeta");
+    PathBuf::from(s)
+}
+
+/// Open the append-only manifest. When `resuming`, append to the existing file;
+/// otherwise (re)create it and write the `total` header. Best-effort - a `None`
+/// just means this run won't be hard-kill-resumable.
+fn open_manifest(path: &Path, total: u64, resuming: bool) -> Option<File> {
+    if resuming {
+        OpenOptions::new().append(true).open(path).ok()
+    } else {
+        let mut f = OpenOptions::new().create(true).write(true).truncate(true).open(path).ok()?;
+        f.write_all(format!("t\t{total}\n").as_bytes()).ok()?;
+        Some(f)
+    }
+}
+
+/// Load completed ranges from a manifest, but only if its `total` header matches.
+/// A malformed or partially-written trailing line is ignored (crash-safe).
+fn load_manifest(path: &Path, total: u64) -> Vec<Done> {
+    let Ok(data) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut header_ok = false;
+    let mut ranges = Vec::new();
+    for line in data.lines() {
+        let f: Vec<&str> = line.split('\t').collect();
+        match f.as_slice() {
+            ["t", tot] => match tot.parse::<u64>() {
+                Ok(v) if v == total => header_ok = true,
+                _ => return Vec::new(), // different file at this path
+            },
+            ["r", off, len, crc] => {
+                if let (Ok(o), Ok(l), Ok(c)) = (off.parse::<u64>(), len.parse::<u64>(), crc.parse::<u32>()) {
+                    if l > 0 && o + l <= total {
+                        ranges.push((o, l, c));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if header_ok {
+        ranges
+    } else {
+        Vec::new()
+    }
+}
+
+/// The byte ranges of `[0, total)` NOT covered by `completed` (which may overlap
+/// or be unsorted) - the work still to download when resuming from a manifest.
+fn gaps(total: u64, completed: &[Done]) -> Vec<Range> {
+    let mut done: Vec<(u64, u64)> = completed.iter().map(|(o, l, _)| (*o, *o + *l)).collect();
+    done.sort_by_key(|(o, _)| *o);
+    let mut out = Vec::new();
+    let mut pos = 0u64;
+    for (o, end) in done {
+        if o > pos {
+            out.push((pos, o - pos));
+        }
+        pos = pos.max(end);
+    }
+    if pos < total {
+        out.push((pos, total - pos));
+    }
+    out
 }
 
 /// Lock a mutex, tolerating poisoning (a panicked worker must not wedge us).
@@ -1502,14 +1615,16 @@ mod tests {
     }
 
     fn new_alloc(start: u64, total: u64, chunk_size: u64) -> Alloc {
+        let todo = if total > start { vec![(start, total - start)] } else { Vec::new() };
         Alloc {
             start,
-            cursor: start,
             total,
             chunk_size,
+            todo,
             reclaim: Vec::new(),
             completed: Vec::new(),
             attempts: HashMap::new(),
+            manifest: None,
         }
     }
 
@@ -1893,5 +2008,68 @@ mod tests {
         for d in [&srv, &local, &dst, &bad] {
             let _ = fs::remove_dir_all(d);
         }
+    }
+
+    #[test]
+    fn gaps_computes_complement() {
+        // completed [0,100) and [300,100) within total 500 -> gaps [100,200),[400,100)
+        let done = vec![(0u64, 100u64, 0u32), (300, 100, 0)];
+        assert_eq!(gaps(500, &done), vec![(100, 200), (400, 100)]);
+        // Full coverage -> no gaps.
+        assert!(gaps(200, &[(0, 200, 0)]).is_empty());
+        // Overlapping + unsorted input still yields the right complement.
+        let done2 = vec![(50u64, 100u64, 0u32), (0, 60, 0)]; // covers [0,150)
+        assert_eq!(gaps(200, &done2), vec![(150, 50)]);
+    }
+
+    /// Hard-kill resume: a full-size holey temp file + a manifest covering part of
+    /// it must resume only the gaps and finish byte-exact (and clean up the
+    /// manifest). This is the case a graceful contiguous-prefix resume can't cover.
+    #[test]
+    fn manifest_resume_downloads_only_gaps() {
+        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let src = std::env::temp_dir().join(format!("zap-man-src-{}", std::process::id()));
+        let dst = std::env::temp_dir().join(format!("zap-man-dst-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dst);
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        let data = upload_payload(300_000);
+        fs::write(src.join("big.bin"), &data).unwrap();
+
+        // Simulate a hard-kill mid-download: the temp file is full size but only
+        // the first `half` bytes are real (the rest zero), and the manifest
+        // records that first range as done.
+        let half = 120_000usize;
+        let part = dst.join(".zap-part-big.bin");
+        {
+            let mut f = OpenOptions::new().create(true).write(true).open(&part).unwrap();
+            f.write_all(&data[..half]).unwrap();
+            f.set_len(data.len() as u64).unwrap();
+        }
+        let hcrc = {
+            let mut c = Crc32::new();
+            c.update(&data[..half]);
+            c.finalize()
+        };
+        fs::write(
+            dst.join(".zap-part-big.bin.zmeta"),
+            format!("t\t{}\nr\t0\t{}\t{}\n", data.len(), half, hcrc),
+        )
+        .unwrap();
+
+        let (port, handle) = serve(&src);
+        let url = format!("http://127.0.0.1:{port}/download?path=big.bin");
+        let report = get_with(&url, &dst, GetOptions { streams: 4, chunk_size: 64 * 1024, adaptive: false })
+            .expect("manifest resume");
+
+        assert!(report.used_fast && report.verified);
+        assert_eq!(report.resumed_from, half as u64, "resumed the manifest-covered prefix");
+        assert_eq!(fs::read(dst.join("big.bin")).unwrap(), data, "manifest-resumed byte-exact");
+        assert!(!dst.join(".zap-part-big.bin.zmeta").exists(), "manifest cleaned up on success");
+
+        handle.stop();
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dst);
     }
 }

@@ -188,13 +188,19 @@ before the atomic rename. The wire format above is unchanged - only the client's
 scheduling differs from a single stream.
 
 **Resume model with holes.** During a run the temp file is pre-sized to
-`total_size` and filled at offsets, so it briefly contains gaps. The client
-guarantees the file at rest is either complete or a valid contiguous prefix: on a
-graceful failure/fallback it truncates to the contiguous prefix, so the next run
-(or the HTTP fallback) resumes by size as usual. A hard process kill mid-run can
-leave a full-size file with holes; the whole-file CRC check catches this and the
-download restarts clean (never surfaced as complete). A future per-file chunk
-manifest (sidecar) would make even a hard-kill resumable - noted, not built.
+`total_size` and filled at offsets, so it contains gaps until complete. Two resume
+paths keep this safe:
+
+- **Graceful failure/fallback:** the client truncates the temp file to its
+  contiguous prefix, so the next run (or the HTTP fallback) resumes by size.
+- **Hard process kill:** a crash-resume **manifest** sidecar
+  (`.zap-part-<name>.zmeta`) records `total` + each completed `(offset, len, crc)`
+  as ranges finish (append-only, no fsync - the OS page cache survives a process
+  kill). On the next run, if the temp file is already full size and a matching
+  manifest exists, the client resumes only the missing gaps instead of
+  restarting. The manifest is deleted on success or on a graceful truncate; the
+  whole-file CRC still backstops correctness (a corrupt/holey file never surfaces
+  as complete).
 
 **Adaptation (implemented).** By default the client adapts live:
 
@@ -218,12 +224,13 @@ the pipe a single congestion-controlled stream cannot, and modest chunks bound t
 cost of a dropped range. On a clean, low-latency link (e.g. loopback) the transfer
 is already near line rate at a few streams, so the ramp simply settles quickly.
 
-**Integrity cost note.** A download is verified with a whole-file CRC-32: the
-server computes it once (cached), the client re-computes it over the assembled
-file before the rename. For very large files this adds a read pass on each side;
-a future optimization could fold per-range CRCs together (`crc32_combine`) to
-verify without the extra pass. Correctness first: a partial or corrupt file is
-never surfaced as complete.
+**Integrity.** A download is verified with a whole-file CRC-32: the server
+computes it once (cached). The client CRCs each range as it streams and folds the
+per-range CRCs into the whole-file CRC with `crc32_combine`, so a fresh download
+verifies with **no** second read pass; a resumed download reads only the on-disk
+prefix and combines the rest. If the ranges can't be reconstructed it falls back
+to a full re-read. Correctness first: a partial or corrupt file is never surfaced
+as complete.
 
 **True loss-tolerance (out of scope):** independent streams with no head-of-line
 blocking and real FEC is QUIC/UDP territory (`quinn`/`iroh`), a separate track.
