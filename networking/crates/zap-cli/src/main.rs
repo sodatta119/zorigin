@@ -68,6 +68,9 @@ fn run() -> Result<()> {
             fixed,
         } => cmd_get(&url, &dest, streams, chunk_mb, fixed),
 
+        // LAN upload over the native fast lane (HTTP fallback).
+        Command::Put { local, url, name } => cmd_put(&local, &url, name.as_deref()),
+
         Command::Devices => {
             let transport = build_transport(cli.transport)?;
             cmd_devices(transport.as_ref())
@@ -121,6 +124,30 @@ fn cmd_get(url: &str, dest: &str, streams: usize, chunk_mb: u64, fixed: bool) ->
         "downloaded {} - {} bytes via {lane}{verified}{resumed} in {elapsed:.2}s ({rate:.1} MB/s)",
         report.path.display(),
         report.total
+    );
+    Ok(())
+}
+
+/// Upload a file to a Zap server, using the fast lane when available.
+fn cmd_put(local: &str, url: &str, name: Option<&str>) -> Result<()> {
+    let started = std::time::Instant::now();
+    let report = web::fast_client::put_with(std::path::Path::new(local), url, name)?;
+    let elapsed = started.elapsed().as_secs_f64();
+    let lane = if report.used_fast { "fast lane" } else { "HTTP" };
+    let verified = if report.verified { ", integrity verified" } else { "" };
+    let resumed = if report.resumed_from > 0 {
+        format!(" (resumed from {} bytes)", report.resumed_from)
+    } else {
+        String::new()
+    };
+    let rate = if elapsed > 0.0 {
+        report.total as f64 / elapsed / (1024.0 * 1024.0)
+    } else {
+        0.0
+    };
+    println!(
+        "uploaded {local} as {} - {} bytes via {lane}{verified}{resumed} in {elapsed:.2}s ({rate:.1} MB/s)",
+        report.name, report.total
     );
     Ok(())
 }

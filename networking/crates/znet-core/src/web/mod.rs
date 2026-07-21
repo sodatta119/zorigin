@@ -486,7 +486,7 @@ fn start_fast(
     if config.tls.is_some() {
         return None;
     }
-    match fast::spawn_listener(config.bind, Arc::clone(dir), Arc::clone(auth), Arc::clone(stats)) {
+    match fast::spawn_listener(config.bind, Arc::clone(dir), Arc::clone(auth), Arc::clone(stats), None) {
         Ok(h) => Some(h),
         Err(e) => {
             eprintln!("zap: fast lane unavailable ({e}); native clients will use HTTP");

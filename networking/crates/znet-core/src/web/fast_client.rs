@@ -13,7 +13,7 @@
 //! this stays consistent.
 
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -677,6 +677,174 @@ fn write_at(file: &std::fs::File, offset: u64, buf: &[u8]) -> Result<()> {
     Ok(())
 }
 
+// ---- Fast lane uploads (PUT) ----
+
+/// The outcome of a completed [`put`].
+#[derive(Debug, Clone)]
+pub struct PutReport {
+    /// Name the file was stored as on the server.
+    pub name: String,
+    /// Whole-file size in bytes.
+    pub total: u64,
+    /// True if the fast lane carried the upload; false if it fell back to HTTP.
+    pub used_fast: bool,
+    /// True if the server verified the whole-file CRC-32.
+    pub verified: bool,
+    /// Bytes the server already held when the upload started (resume point).
+    pub resumed_from: u64,
+}
+
+/// Upload `local` to the Zap server at `url`, saved under its own name (override
+/// with `name_override`). Uses the fast lane when the peer advertises one, else
+/// HTTP. Resumable and CRC-verified on both paths.
+pub fn put(local: &Path, url: &str) -> Result<PutReport> {
+    put_with(local, url, None)
+}
+
+/// Like [`put`], with an explicit destination name.
+pub fn put_with(local: &Path, url: &str, name_override: Option<&str>) -> Result<PutReport> {
+    let meta = fs::metadata(local).with_context(|| format!("reading {}", local.display()))?;
+    if !meta.is_file() {
+        bail!("{} is not a file", local.display());
+    }
+    let total = meta.len();
+    let name = name_override
+        .map(|s| s.to_string())
+        .or_else(|| local.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()))
+        .filter(|s| super::is_plain_filename(s))
+        .ok_or_else(|| anyhow!("could not determine a valid upload name"))?;
+    let crc = crc32_file(local).ok();
+    let target = parse_put_target(url, &name)?;
+
+    let fast_port = probe_fast_port(&target).unwrap_or(None);
+    if let Some(fp) = fast_port {
+        match fast_put(local, &target, fp, total, crc) {
+            Ok((verified, resumed)) => {
+                return Ok(PutReport { name, total, used_fast: true, verified, resumed_from: resumed });
+            }
+            Err(e) => {
+                eprintln!("zap: fast lane upload failed ({e:#}); falling back to HTTP");
+            }
+        }
+    }
+
+    let (verified, resumed) = http_put(local, &target, &name, total, crc)?;
+    Ok(PutReport { name, total, used_fast: false, verified, resumed_from: resumed })
+}
+
+/// Upload over the fast lane, retrying (and resuming from the server's reported
+/// offset) on transient failure. Returns `(verified, resumed_from)`.
+fn fast_put(local: &Path, t: &Target, fast_port: u16, total: u64, crc: Option<u32>) -> Result<(bool, u64)> {
+    const ATTEMPTS: u32 = 4;
+    let mut first_offset = None;
+    let mut last_err = None;
+    for attempt in 1..=ATTEMPTS {
+        match fast_put_once(local, t, fast_port, total, crc) {
+            Ok((verified, server_offset)) => {
+                let resumed = first_offset.unwrap_or(server_offset);
+                return Ok((verified, resumed));
+            }
+            Err((e, server_offset)) => {
+                if first_offset.is_none() {
+                    first_offset = server_offset;
+                }
+                last_err = Some(e);
+                if attempt < ATTEMPTS {
+                    thread::sleep(Duration::from_millis(200));
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("fast lane upload failed")))
+}
+
+/// One fast-lane upload attempt: handshake, receive the authoritative resume
+/// offset, stream `[offset, total)`, and read the final status. On error returns
+/// the server offset (if known) so the caller can report the resume point.
+fn fast_put_once(
+    local: &Path,
+    t: &Target,
+    fast_port: u16,
+    total: u64,
+    crc: Option<u32>,
+) -> std::result::Result<(bool, u64), (anyhow::Error, Option<u64>)> {
+    let mut stream = connect_fast(t, fast_port).map_err(|e| (e, None))?;
+    let token = t.token.clone().unwrap_or_default();
+    write_put_handshake(&mut stream, &token, &t.file_path, total, crc).map_err(|e| (e, None))?;
+    let server_offset = read_put_reply(&mut stream).map_err(|e| (e, None))?;
+
+    let mut stream_send = || -> Result<bool> {
+        let mut file = File::open(local)?;
+        file.seek(SeekFrom::Start(server_offset))?;
+        let mut remaining = total.saturating_sub(server_offset);
+        let mut buf = [0u8; CHUNK];
+        while remaining > 0 {
+            let want = remaining.min(buf.len() as u64) as usize;
+            let n = file.read(&mut buf[..want])?;
+            if n == 0 {
+                break;
+            }
+            stream.write_all(&buf[..n])?;
+            remaining -= n as u64;
+        }
+        stream.flush()?;
+        // Final status: 0 = ok/verified, non-zero = failed on the server.
+        let mut fin = [0u8; 1];
+        stream.read_exact(&mut fin)?;
+        match fin[0] {
+            fast::ST_OK => Ok(crc.is_some()),
+            fast::ST_INTEGRITY => bail!("server reported an integrity check failure"),
+            s => bail!("server reported upload failure (status {s})"),
+        }
+    };
+    stream_send().map(|verified| (verified, server_offset)).map_err(|e| (e, Some(server_offset)))
+}
+
+/// Write a PUT handshake: op=PUT, destination `path`, the whole-file `total`, and
+/// an optional whole-file CRC the server verifies on completion. `offset` is sent
+/// as 0 - the server replies with the authoritative resume offset.
+fn write_put_handshake(stream: &mut TcpStream, token: &str, path: &str, total: u64, crc: Option<u32>) -> Result<()> {
+    let path_bytes = path.as_bytes();
+    let mut hs = Vec::with_capacity(32 + token.len() + path_bytes.len());
+    hs.extend_from_slice(fast::MAGIC);
+    hs.extend_from_slice(&fast::VERSION.to_le_bytes());
+    hs.push(fast::OP_PUT);
+    hs.extend_from_slice(&(token.len() as u16).to_le_bytes());
+    hs.extend_from_slice(token.as_bytes());
+    hs.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
+    hs.extend_from_slice(path_bytes);
+    hs.extend_from_slice(&0u64.to_le_bytes()); // client offset (server is authoritative)
+    hs.extend_from_slice(&total.to_le_bytes());
+    match crc {
+        Some(c) => {
+            hs.push(1);
+            hs.extend_from_slice(&c.to_le_bytes());
+        }
+        None => hs.push(0),
+    }
+    stream.write_all(&hs)?;
+    stream.flush()?;
+    Ok(())
+}
+
+/// Read a PUT handshake reply: `Ok(offset)` (the byte offset to start sending
+/// from), or an error carrying the server's message.
+fn read_put_reply(stream: &mut TcpStream) -> Result<u64> {
+    let mut status = [0u8; 1];
+    stream.read_exact(&mut status)?;
+    if status[0] != fast::ST_OK {
+        let mut lenb = [0u8; 2];
+        stream.read_exact(&mut lenb)?;
+        let mlen = u16::from_le_bytes(lenb) as usize;
+        let mut msg = vec![0u8; mlen];
+        stream.read_exact(&mut msg).ok();
+        bail!("server said: {}", String::from_utf8_lossy(&msg));
+    }
+    let mut b8 = [0u8; 8];
+    stream.read_exact(&mut b8)?;
+    Ok(u64::from_le_bytes(b8))
+}
+
 // ---- HTTP fallback ----
 
 /// Finish (or perform) the download over the HTTP path, resuming from any bytes
@@ -770,10 +938,17 @@ fn auth_headers(t: &Target) -> Vec<(String, String)> {
 /// start, and the parsed `Content-Length`.
 struct HttpResponse {
     status: u16,
-    #[allow(dead_code)]
     headers: Vec<(String, String)>,
     reader: BufReader<TcpStream>,
     content_length: Option<u64>,
+}
+
+/// Look up a response header value, case-insensitively.
+fn header<'a>(resp: &'a HttpResponse, name: &str) -> Option<&'a str> {
+    resp.headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
 }
 
 /// Perform a minimal plain-HTTP/1.1 request (`Connection: close`, one request per
@@ -799,8 +974,11 @@ fn http_request(
         w.write_all(req.as_bytes())?;
         w.flush()?;
     }
+    read_http_response(BufReader::new(stream))
+}
 
-    let mut reader = BufReader::new(stream);
+/// Read a response's status line + headers, leaving the reader at the body start.
+fn read_http_response(mut reader: BufReader<TcpStream>) -> Result<HttpResponse> {
     let mut status_line = String::new();
     reader.read_line(&mut status_line)?;
     let status = parse_status(&status_line)?;
@@ -826,12 +1004,7 @@ fn http_request(
             headers.push((k, v));
         }
     }
-    Ok(HttpResponse {
-        status,
-        headers,
-        reader,
-        content_length,
-    })
+    Ok(HttpResponse { status, headers, reader, content_length })
 }
 
 fn parse_status(line: &str) -> Result<u16> {
@@ -839,6 +1012,105 @@ fn parse_status(line: &str) -> Result<u16> {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| anyhow!("malformed HTTP status line: {line:?}"))
+}
+
+/// HTTP upload fallback: resume from the server's current offset (via a HEAD),
+/// then PUT the remaining bytes with the whole-file total + CRC so the server
+/// verifies and atomically renames - identical semantics to the browser's
+/// resumable upload. Returns `(verified, resumed_from)`.
+fn http_put(local: &Path, t: &Target, name: &str, total: u64, crc: Option<u32>) -> Result<(bool, u64)> {
+    let enc = percent_encode(name);
+    let mut offset = http_head_offset(t, &enc).unwrap_or(0);
+    if offset > total {
+        offset = 0;
+    }
+    let first = offset;
+    for _ in 0..6 {
+        let target = format!("/upload?path=&name={enc}&offset={offset}");
+        let mut headers = auth_headers(t);
+        headers.push(("X-Zap-Total".to_string(), total.to_string()));
+        if let Some(c) = crc {
+            headers.push(("X-Zap-Crc32".to_string(), format!("{c:08x}")));
+        }
+        let resp = http_put_body(t, &target, &headers, local, offset, total.saturating_sub(offset))?;
+        match resp.status {
+            200 => {
+                let verified = header(&resp, "X-Zap-Verified") == Some("true");
+                return Ok((verified, first));
+            }
+            409 => {
+                // Offset mismatch: re-sync to the server's real offset and retry.
+                offset = header(&resp, "X-Zap-Offset").and_then(|v| v.parse().ok()).unwrap_or(offset);
+            }
+            422 => bail!("HTTP upload failed the server integrity check"),
+            _ => {
+                offset = header(&resp, "X-Zap-Offset").and_then(|v| v.parse().ok()).unwrap_or(offset);
+            }
+        }
+    }
+    bail!("HTTP upload did not complete")
+}
+
+/// `HEAD /upload?path=&name=` -> the bytes the server already holds.
+fn http_head_offset(t: &Target, enc_name: &str) -> Result<u64> {
+    let target = format!("/upload?path=&name={enc_name}");
+    let resp = http_request(&t.host, t.port, "HEAD", &target, &auth_headers(t))?;
+    Ok(header(&resp, "X-Zap-Offset").and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+/// Send a `PUT` whose body is `local[offset..offset+len]`, returning the response.
+fn http_put_body(
+    t: &Target,
+    target: &str,
+    headers: &[(String, String)],
+    local: &Path,
+    offset: u64,
+    len: u64,
+) -> Result<HttpResponse> {
+    let stream = TcpStream::connect((t.host.as_str(), t.port))
+        .with_context(|| format!("connecting to {}:{}", t.host, t.port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(60))).ok();
+
+    let mut req = format!(
+        "PUT {target} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Length: {len}\r\n",
+        t.host
+    );
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
+    {
+        let mut w = &stream;
+        w.write_all(req.as_bytes())?;
+        let mut file = File::open(local)?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut remaining = len;
+        let mut buf = [0u8; CHUNK];
+        while remaining > 0 {
+            let want = remaining.min(buf.len() as u64) as usize;
+            let n = file.read(&mut buf[..want])?;
+            if n == 0 {
+                break;
+            }
+            w.write_all(&buf[..n])?;
+            remaining -= n as u64;
+        }
+        w.flush()?;
+    }
+    read_http_response(BufReader::new(stream))
+}
+
+/// Percent-encode a string for use as a URL query value (RFC 3986 unreserved set
+/// stays literal; everything else is `%XX`).
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 // ---- URL + destination parsing ----
@@ -883,6 +1155,33 @@ fn parse_target(url: &str) -> Result<Target> {
         file_path,
         token,
         filename,
+    })
+}
+
+/// Parse a Zap server URL for uploading: `http://host[:port]/[?k=<token>]`. No
+/// `?path=` is needed - the destination is `name` in the server's share root.
+fn parse_put_target(url: &str, name: &str) -> Result<Target> {
+    let rest = url.strip_prefix("http://").ok_or_else(|| {
+        if url.starts_with("https://") {
+            anyhow!("`zap put` speaks plain HTTP only for now; upload from the app instead")
+        } else {
+            anyhow!("expected an http:// URL, got: {url}")
+        }
+    })?;
+    let (authority, pathq) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = split_authority(authority);
+    let (_, query) = super::split_query(pathq);
+    let token = super::query_param(query, "k").map(super::decode_percent);
+    Ok(Target {
+        host,
+        port,
+        raw_path: name.to_string(),
+        file_path: name.to_string(),
+        token,
+        filename: name.to_string(),
     })
 }
 
@@ -1254,5 +1553,108 @@ mod tests {
         handle.stop();
         let _ = fs::remove_dir_all(&src);
         let _ = fs::remove_dir_all(&dst);
+    }
+
+    fn upload_payload(len: usize) -> Vec<u8> {
+        (0..len as u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 12) as u8 ^ (i as u8))
+            .collect()
+    }
+
+    /// Fast-lane upload lands byte-exact in the server's share dir and the server
+    /// verifies the whole-file CRC.
+    #[test]
+    fn fast_put_uploads_byte_exact() {
+        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let localdir = std::env::temp_dir().join(format!("zap-put-local-{}", std::process::id()));
+        let serverdir = std::env::temp_dir().join(format!("zap-put-srv-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&localdir);
+        let _ = fs::remove_dir_all(&serverdir);
+        fs::create_dir_all(&localdir).unwrap();
+        fs::create_dir_all(&serverdir).unwrap();
+        let data = upload_payload(400_000);
+        fs::write(localdir.join("clip.bin"), &data).unwrap();
+
+        let (port, handle) = serve(&serverdir);
+        let url = format!("http://127.0.0.1:{port}/");
+        let report = put_with(&localdir.join("clip.bin"), &url, None).expect("fast put");
+
+        assert!(report.used_fast, "should use the fast lane");
+        assert!(report.verified, "server should verify the CRC");
+        assert_eq!(report.name, "clip.bin");
+        assert_eq!(report.resumed_from, 0);
+        assert_eq!(fs::read(serverdir.join("clip.bin")).unwrap(), data, "uploaded byte-exact");
+        assert!(!serverdir.join(".zap-part-clip.bin").exists(), "temp file removed");
+
+        handle.stop();
+        let _ = fs::remove_dir_all(&localdir);
+        let _ = fs::remove_dir_all(&serverdir);
+    }
+
+    /// A partial `.zap-part-` already on the server is resumed, not restarted.
+    #[test]
+    fn fast_put_resumes_from_partial() {
+        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let localdir = std::env::temp_dir().join(format!("zap-putr-local-{}", std::process::id()));
+        let serverdir = std::env::temp_dir().join(format!("zap-putr-srv-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&localdir);
+        let _ = fs::remove_dir_all(&serverdir);
+        fs::create_dir_all(&localdir).unwrap();
+        fs::create_dir_all(&serverdir).unwrap();
+        let data = upload_payload(350_000);
+        fs::write(localdir.join("clip.bin"), &data).unwrap();
+        // Server already holds the first 90_000 correct bytes.
+        let seeded = 90_000usize;
+        fs::write(serverdir.join(".zap-part-clip.bin"), &data[..seeded]).unwrap();
+
+        let (port, handle) = serve(&serverdir);
+        let url = format!("http://127.0.0.1:{port}/");
+        let report = put_with(&localdir.join("clip.bin"), &url, None).expect("fast put resume");
+
+        assert!(report.used_fast);
+        assert_eq!(report.resumed_from, seeded as u64, "should resume from the server offset");
+        assert_eq!(fs::read(serverdir.join("clip.bin")).unwrap(), data, "resumed upload byte-exact");
+
+        handle.stop();
+        let _ = fs::remove_dir_all(&localdir);
+        let _ = fs::remove_dir_all(&serverdir);
+    }
+
+    /// The HTTP upload fallback lands byte-exact and resumes from a partial.
+    #[test]
+    fn http_put_fallback_uploads_and_resumes() {
+        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let localdir = std::env::temp_dir().join(format!("zap-puth-local-{}", std::process::id()));
+        let serverdir = std::env::temp_dir().join(format!("zap-puth-srv-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&localdir);
+        let _ = fs::remove_dir_all(&serverdir);
+        fs::create_dir_all(&localdir).unwrap();
+        fs::create_dir_all(&serverdir).unwrap();
+        let data = upload_payload(250_000);
+        let local = localdir.join("clip.bin");
+        fs::write(&local, &data).unwrap();
+
+        let (port, handle) = serve(&serverdir);
+        let url = format!("http://127.0.0.1:{port}/");
+        let target = parse_put_target(&url, "clip.bin").unwrap();
+        let crc = crc32_file(&local).ok();
+
+        // Fresh HTTP upload.
+        let (verified, resumed) = http_put(&local, &target, "clip.bin", data.len() as u64, crc).expect("http put");
+        assert!(verified, "server verifies the CRC over HTTP too");
+        assert_eq!(resumed, 0);
+        assert_eq!(fs::read(serverdir.join("clip.bin")).unwrap(), data, "HTTP upload byte-exact");
+
+        // Seed a partial and resume over HTTP.
+        let _ = fs::remove_file(serverdir.join("clip.bin"));
+        fs::write(serverdir.join(".zap-part-clip.bin"), &data[..70_000]).unwrap();
+        let (verified2, resumed2) = http_put(&local, &target, "clip.bin", data.len() as u64, crc).expect("http put resume");
+        assert!(verified2);
+        assert_eq!(resumed2, 70_000, "HTTP resumes from the server offset");
+        assert_eq!(fs::read(serverdir.join("clip.bin")).unwrap(), data, "HTTP resume byte-exact");
+
+        handle.stop();
+        let _ = fs::remove_dir_all(&localdir);
+        let _ = fs::remove_dir_all(&serverdir);
     }
 }

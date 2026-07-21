@@ -14,7 +14,7 @@
 //! their semantics so the Transfers UI, resume, and integrity behave identically.
 
 use std::collections::HashMap;
-use std::fs::{File, Metadata};
+use std::fs::{File, Metadata, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -31,8 +31,7 @@ pub(crate) const MAGIC: &[u8; 4] = b"ZAPX";
 pub(crate) const VERSION: u16 = 1;
 /// Handshake op: download a byte range.
 pub(crate) const OP_GET: u8 = 1;
-/// Handshake op: upload (reserved for a later phase; v1 rejects it).
-#[allow(dead_code)]
+/// Handshake op: upload a file (resumable, CRC-verified).
 pub(crate) const OP_PUT: u8 = 2;
 
 // Reply status codes (see docs/fast-lane-protocol.md §4).
@@ -41,6 +40,8 @@ pub(crate) const ST_BAD_REQUEST: u8 = 1;
 pub(crate) const ST_UNAUTHORIZED: u8 = 2;
 pub(crate) const ST_NOT_FOUND: u8 = 3;
 pub(crate) const ST_UNSUPPORTED: u8 = 4;
+pub(crate) const ST_SERVER_ERROR: u8 = 5;
+pub(crate) const ST_INTEGRITY: u8 = 6;
 
 /// Cap on the handshake `path` length, to bound allocation from a hostile or
 /// buggy client (paths are short; this is generous headroom).
@@ -96,14 +97,25 @@ fn wake_addr(listen: SocketAddr) -> SocketAddr {
     SocketAddr::new(ip, listen.port())
 }
 
+/// TLS material for the fast-lane listener: a rustls server config under the
+/// `tls` feature, and an uninhabited-in-practice `()` otherwise (the fast lane is
+/// only ever asked to run TLS when the feature is on, since the HTTP server that
+/// carries the same cert cannot bind HTTPS without it either).
+#[cfg(feature = "tls")]
+pub(crate) type FastServerTls = std::sync::Arc<rustls::ServerConfig>;
+#[cfg(not(feature = "tls"))]
+pub(crate) type FastServerTls = ();
+
 /// Bind the fast-lane listener on `bind:0` (OS-assigned port) and start its
 /// acceptor thread. Each connection is handled on its own thread, exactly like
-/// the HTTP accept loop. Returns a handle carrying the chosen port.
+/// the HTTP accept loop. When `tls` is set, connections are wrapped in the shared
+/// rustls server session. Returns a handle carrying the chosen port.
 pub(crate) fn spawn_listener(
     bind: IpAddr,
     dir: Arc<PathBuf>,
     auth: Arc<Option<Auth>>,
     stats: Arc<Stats>,
+    tls: Option<FastServerTls>,
 ) -> io::Result<FastHandle> {
     let listener = TcpListener::bind(SocketAddr::new(bind, 0))?;
     let local_addr = listener.local_addr()?;
@@ -119,11 +131,16 @@ pub(crate) fn spawn_listener(
                 }
                 match stream {
                     Ok(s) => {
+                        // Socket options are set here (before any TLS wrap) so the
+                        // connection handler can stay generic over the stream type.
+                        s.set_nodelay(true).ok();
+                        s.set_read_timeout(Some(Duration::from_secs(60))).ok();
                         let dir = Arc::clone(&dir);
                         let auth = Arc::clone(&auth);
                         let stats = Arc::clone(&stats);
+                        let tls = tls.clone();
                         thread::spawn(move || {
-                            if let Err(e) = handle_conn(s, &dir, (*auth).as_ref(), &stats) {
+                            if let Err(e) = serve_connection(s, tls.as_ref(), &dir, (*auth).as_ref(), &stats) {
                                 eprintln!("zap: fast-lane connection error: {e:#}");
                             }
                         });
@@ -146,16 +163,38 @@ pub(crate) fn spawn_listener(
     })
 }
 
-/// Handle one fast-lane connection: read the handshake, authenticate, and (for a
-/// GET) stream the requested byte range. Integrity and resume mirror the HTTP
-/// path - a whole-file CRC-32 is sent so the client can verify byte-exactness,
-/// and the client drives resume by re-handshaking with a new `offset`.
-fn handle_conn(mut stream: TcpStream, dir: &Path, auth: Option<&Auth>, stats: &Stats) -> io::Result<()> {
-    stream.set_nodelay(true).ok();
-    // A dead peer must not hang a worker thread forever. Generous so a slow but
-    // alive link is not falsely cut; the client resumes on any drop anyway.
-    stream.set_read_timeout(Some(Duration::from_secs(60))).ok();
+/// Take one accepted connection, optionally wrap it in the shared rustls server
+/// session, and hand it to the (stream-generic) protocol handler. Keeping the
+/// TLS wrap here lets [`handle_conn`] stay generic over the stream type.
+fn serve_connection(
+    s: TcpStream,
+    tls: Option<&FastServerTls>,
+    dir: &Path,
+    auth: Option<&Auth>,
+    stats: &Stats,
+) -> io::Result<()> {
+    #[cfg(feature = "tls")]
+    {
+        if let Some(cfg) = tls {
+            let conn = rustls::ServerConnection::new(std::sync::Arc::clone(cfg))
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tls setup: {e}")))?;
+            let stream = rustls::StreamOwned::new(conn, s);
+            return handle_conn(stream, dir, auth, stats);
+        }
+    }
+    #[cfg(not(feature = "tls"))]
+    let _ = tls;
+    handle_conn(s, dir, auth, stats)
+}
 
+/// Read the handshake, authenticate, and dispatch a GET (download) or PUT
+/// (upload). Generic over the stream so it serves both plain TCP and TLS.
+fn handle_conn<S: Read + Write>(
+    mut stream: S,
+    dir: &Path,
+    auth: Option<&Auth>,
+    stats: &Stats,
+) -> io::Result<()> {
     // ---- Handshake (client -> server) ----
     let mut magic = [0u8; 4];
     stream.read_exact(&mut magic)?;
@@ -174,8 +213,6 @@ fn handle_conn(mut stream: TcpStream, dir: &Path, auth: Option<&Auth>, stats: &S
         return reply_err(&mut stream, ST_BAD_REQUEST, "path too long");
     }
     let path = read_string(&mut stream, path_len)?;
-    let offset = read_u64(&mut stream)?;
-    let range_len = read_u64(&mut stream)?;
 
     // ---- Auth (same token as the HTTP `?k=` / zap_session cookie) ----
     if let Some(a) = auth {
@@ -183,17 +220,45 @@ fn handle_conn(mut stream: TcpStream, dir: &Path, auth: Option<&Auth>, stats: &S
             return reply_err(&mut stream, ST_UNAUTHORIZED, "unauthorized");
         }
     }
-    if op != OP_GET {
-        return reply_err(&mut stream, ST_UNSUPPORTED, "op not supported in v1");
-    }
 
-    // ---- Resolve the file (same sandbox rule as the HTTP download) ----
-    let Some(fpath) = resolve_within(dir, &path) else {
-        return reply_err(&mut stream, ST_NOT_FOUND, "bad path");
+    match op {
+        OP_GET => {
+            let offset = read_u64(&mut stream)?;
+            let range_len = read_u64(&mut stream)?;
+            handle_get(&mut stream, dir, &path, offset, range_len, stats)
+        }
+        OP_PUT => {
+            let _client_offset = read_u64(&mut stream)?;
+            let total = read_u64(&mut stream)?;
+            let has_crc = read_u8(&mut stream)?;
+            let expected_crc = if has_crc == 1 {
+                Some(read_u32(&mut stream)?)
+            } else {
+                None
+            };
+            handle_put(&mut stream, dir, &path, total, expected_crc, stats)
+        }
+        _ => reply_err(&mut stream, ST_UNSUPPORTED, "unsupported op"),
+    }
+}
+
+/// Serve a GET: reply with total_size + whole-file CRC, then stream the requested
+/// byte range `[offset, offset+range_len)` (range_len 0 = to EOF). Integrity and
+/// resume mirror the HTTP path; a zero-length request is a stat (header only).
+fn handle_get<S: Read + Write>(
+    stream: &mut S,
+    dir: &Path,
+    path: &str,
+    offset: u64,
+    range_len: u64,
+    stats: &Stats,
+) -> io::Result<()> {
+    let Some(fpath) = resolve_within(dir, path) else {
+        return reply_err(stream, ST_NOT_FOUND, "bad path");
     };
     let meta = match std::fs::metadata(&fpath) {
         Ok(m) if m.is_file() => m,
-        _ => return reply_err(&mut stream, ST_NOT_FOUND, "not found"),
+        _ => return reply_err(stream, ST_NOT_FOUND, "not found"),
     };
     let total = meta.len();
     let start = offset.min(total);
@@ -203,15 +268,13 @@ fn handle_conn(mut stream: TcpStream, dir: &Path, auth: Option<&Auth>, stats: &S
         range_len.min(total - start)
     };
 
-    // Whole-file CRC-32 so the client can prove the assembled file is byte-exact
-    // before renaming it into place - the same integrity primitive the HTTP
-    // upload path uses. Cached per (path, size, mtime) so the many handshakes of
-    // a multi-stream download read the file just once, not once per connection.
-    // The client stats the file first (one connection), which warms the cache
-    // before the parallel workers hand-shake. Best-effort: no CRC on read error.
+    // Whole-file CRC-32 so the client can prove the assembled file is byte-exact.
+    // Cached per (path, size, mtime) so the many handshakes of a multi-stream
+    // download read the file once, not once per connection (the client's upfront
+    // stat warms the cache). Best-effort: no CRC on read error.
     let crc = cached_crc(&fpath, &meta);
 
-    // ---- Reply (server -> client): status + total_size + optional CRC ----
+    // ---- Reply: status + total_size + optional CRC ----
     let mut head = Vec::with_capacity(14);
     head.push(ST_OK);
     head.extend_from_slice(&total.to_le_bytes());
@@ -224,23 +287,19 @@ fn handle_conn(mut stream: TcpStream, dir: &Path, auth: Option<&Auth>, stats: &S
     }
     stream.write_all(&head)?;
 
-    // A zero-length request is a "stat": the client only wanted total_size + CRC
-    // (e.g. to plan a multi-stream download). Send the header, no data, and skip
-    // the transfer bookkeeping so it never shows as a spurious transfer.
+    // Zero-length request = stat: header only, no data, no transfer row.
     if len == 0 {
         stream.flush()?;
         return Ok(());
     }
 
-    // Coalesce into one transfer row keyed by path (whole-file total), exactly
-    // like the HTTP download does for its many Range chunks.
+    // Coalesce into one transfer row keyed by path, like the HTTP download.
     let filename = fpath
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "download".to_string());
     let path_key = fpath.to_string_lossy().into_owned();
     let transfer = stats.begin_download(&path_key, &filename, Some(total), &path_key);
-    // Reflect bytes the client already holds so the bar resumes, not restarts.
     transfer.done.fetch_max(start, Ordering::Relaxed);
 
     // ---- Data: raw bytes for [start, start+len) ----
@@ -263,8 +322,6 @@ fn handle_conn(mut stream: TcpStream, dir: &Path, auth: Option<&Auth>, stats: &S
     }
     stream.flush()?;
 
-    // Only finish the coalesced row once the whole file has been delivered;
-    // otherwise this was one range of a transfer still in progress.
     if transfer.done.load(Ordering::Relaxed) >= total {
         transfer.finished.store(true, Ordering::Relaxed);
         transfer.ok.store(true, Ordering::Relaxed);
@@ -273,10 +330,114 @@ fn handle_conn(mut stream: TcpStream, dir: &Path, auth: Option<&Auth>, stats: &S
     Ok(())
 }
 
+/// Serve a PUT: reply with the authoritative resume offset (bytes already on
+/// disk), receive `[offset, total)` into the `.zap-part-<name>` temp file, verify
+/// the whole-file CRC-32, atomically rename into place, and send a final status.
+/// This mirrors the HTTP resumable upload exactly (same temp file, same
+/// coalesced transfer row, same integrity + atomic-rename rules).
+fn handle_put<S: Read + Write>(
+    stream: &mut S,
+    dir: &Path,
+    path: &str,
+    total: u64,
+    expected_crc: Option<u32>,
+    stats: &Stats,
+) -> io::Result<()> {
+    let Some(dest) = resolve_within(dir, path) else {
+        return reply_err(stream, ST_NOT_FOUND, "bad path");
+    };
+    let Some(name) = dest.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        return reply_err(stream, ST_BAD_REQUEST, "bad destination");
+    };
+    let folder = dest.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| dir.to_path_buf());
+    if std::fs::create_dir_all(&folder).is_err() {
+        return reply_err(stream, ST_SERVER_ERROR, "mkdir failed");
+    }
+
+    let part = folder.join(format!("{}{name}", super::PART_PREFIX));
+    let mut cur = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+    if cur > total {
+        // Stale/oversized partial: discard and restart clean.
+        let _ = std::fs::remove_file(&part);
+        cur = 0;
+    }
+
+    // ---- Reply: status + authoritative offset the client should send from ----
+    let mut head = Vec::with_capacity(9);
+    head.push(ST_OK);
+    head.extend_from_slice(&cur.to_le_bytes());
+    stream.write_all(&head)?;
+    stream.flush()?;
+
+    // Coalesce chunks/resumes into one upload row keyed by the temp path.
+    let key = part.to_string_lossy().into_owned();
+    let dest_str = dest.to_string_lossy().into_owned();
+    let transfer = stats.begin_upload(&key, &name, Some(total), &dest_str);
+    transfer.done.fetch_max(cur, Ordering::Relaxed);
+
+    // ---- Receive [cur, total) and append to the temp file ----
+    let mut file = OpenOptions::new().create(true).append(true).open(&part)?;
+    let mut received = cur;
+    let mut remaining = total.saturating_sub(cur);
+    let mut buf = [0u8; CHUNK];
+    let mut write_err = false;
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        let n = match stream.read(&mut buf[..want]) {
+            Ok(0) => break, // client dropped
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        if file.write_all(&buf[..n]).is_err() {
+            write_err = true;
+            break;
+        }
+        received += n as u64;
+        remaining -= n as u64;
+        stats.bytes.fetch_add(n as u64, Ordering::Relaxed);
+        transfer.done.fetch_max(received, Ordering::Relaxed);
+    }
+    let _ = file.flush();
+
+    let newsize = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(received);
+    if write_err || newsize < total {
+        // Incomplete: leave the temp file for the client to resume from. Best
+        // effort to tell the client (the socket may already be broken).
+        return put_final(stream, ST_SERVER_ERROR);
+    }
+
+    transfer.finished.store(true, Ordering::Relaxed);
+    let verified = match expected_crc {
+        Some(want) => matches!(crc32_file(&part), Ok(got) if got == want),
+        None => true,
+    };
+    if !verified {
+        let _ = std::fs::remove_file(&part); // corrupt: discard so a retry is clean
+        stats.save_history();
+        return put_final(stream, ST_INTEGRITY);
+    }
+    if std::fs::rename(&part, &dest).is_err() {
+        return put_final(stream, ST_SERVER_ERROR);
+    }
+    transfer.ok.store(true, Ordering::Relaxed);
+    if expected_crc.is_some() {
+        transfer.verified.store(true, Ordering::Relaxed);
+    }
+    stats.save_history();
+    put_final(stream, ST_OK)
+}
+
+/// Send the single-byte final status of a PUT (0 = ok/verified, non-zero = fail).
+fn put_final<S: Write>(stream: &mut S, status: u8) -> io::Result<()> {
+    stream.write_all(&[status])?;
+    let _ = stream.flush();
+    Ok(())
+}
+
 /// Write an error reply (`status`, then a length-prefixed UTF-8 message) and
 /// return `Ok` - the connection then closes. The client maps this to a fast-lane
 /// failure and falls back to HTTP.
-fn reply_err(stream: &mut TcpStream, status: u8, msg: &str) -> io::Result<()> {
+fn reply_err<S: Write>(stream: &mut S, status: u8, msg: &str) -> io::Result<()> {
     let bytes = msg.as_bytes();
     let len = bytes.len().min(u16::MAX as usize);
     let mut out = Vec::with_capacity(3 + len);

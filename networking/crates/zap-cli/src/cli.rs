@@ -77,6 +77,19 @@ pub enum Command {
         fixed: bool,
     },
 
+    /// Upload a file to another Zap over the LAN, using the native fast lane when
+    /// available and falling back to HTTP. Give it a Zap server link, e.g.
+    /// `zap put ~/clip.mp4 "http://192.168.1.5:8080/?k=<token>"`.
+    Put {
+        /// Local file to upload.
+        local: String,
+        /// Zap server URL (include `?k=<token>` if the server is secured).
+        url: String,
+        /// Save on the server under this name (defaults to the local filename).
+        #[arg(long)]
+        name: Option<String>,
+    },
+
     /// Start a web server so a phone can transfer files over Wi-Fi (no app).
     Serve {
         /// Directory to share and to receive uploads into.

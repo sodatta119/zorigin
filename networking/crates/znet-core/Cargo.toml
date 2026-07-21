@@ -11,10 +11,10 @@ path = "src/lib.rs"
 
 [features]
 # Optional end-to-end encryption (native <-> native): a self-signed TLS server
-# via tiny_http's rustls backend, plus cert generation + fingerprint. Off by
-# default so the core stays tiny and the no-app browser receiver keeps working
-# over plain HTTP.
-tls = ["tiny_http/ssl-rustls", "dep:rcgen", "dep:sha2"]
+# via tiny_http's rustls backend for the HTTP path, plus a rustls server/client
+# for the custom fast lane, cert generation + fingerprint. Off by default so the
+# core stays tiny and the no-app browser receiver keeps working over plain HTTP.
+tls = ["tiny_http/ssl-rustls", "dep:rcgen", "dep:sha2", "dep:rustls"]
 
 [dependencies]
 anyhow.workspace = true
@@ -22,9 +22,8 @@ tiny_http.workspace = true
 socket2.workspace = true
 rcgen = { version = "0.13", optional = true }
 sha2 = { version = "0.10", optional = true }
-
-[dev-dependencies]
-# The pinning client used by the TLS integration test (independent of
-# tiny_http's internal rustls 0.20; they only exchange PEM/DER bytes). `ring`
-# provider to match the app and build without nasm/cmake.
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Used (under `tls`) both by the fast-lane TLS server/client and by the pinning
+# client in the TLS integration test. Independent of tiny_http's internal rustls
+# 0.20 - they only exchange PEM/DER bytes. `ring` provider to match the app and
+# build without nasm/cmake.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
