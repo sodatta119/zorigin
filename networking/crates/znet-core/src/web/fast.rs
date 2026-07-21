@@ -13,14 +13,15 @@
 //! `begin_download` transfer bookkeeping) instead of reinventing them, matching
 //! their semantics so the Transfers UI, resume, and integrity behave identically.
 
-use std::fs::File;
+use std::collections::HashMap;
+use std::fs::{File, Metadata};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use super::{crc32_file, resolve_within, Auth, Stats};
 
@@ -204,8 +205,11 @@ fn handle_conn(mut stream: TcpStream, dir: &Path, auth: Option<&Auth>, stats: &S
 
     // Whole-file CRC-32 so the client can prove the assembled file is byte-exact
     // before renaming it into place - the same integrity primitive the HTTP
-    // upload path uses. Best-effort: if the read fails, send no CRC (has_crc=0).
-    let crc = crc32_file(&fpath).ok();
+    // upload path uses. Cached per (path, size, mtime) so the many handshakes of
+    // a multi-stream download read the file just once, not once per connection.
+    // The client stats the file first (one connection), which warms the cache
+    // before the parallel workers hand-shake. Best-effort: no CRC on read error.
+    let crc = cached_crc(&fpath, &meta);
 
     // ---- Reply (server -> client): status + total_size + optional CRC ----
     let mut head = Vec::with_capacity(14);
@@ -219,6 +223,14 @@ fn handle_conn(mut stream: TcpStream, dir: &Path, auth: Option<&Auth>, stats: &S
         None => head.push(0),
     }
     stream.write_all(&head)?;
+
+    // A zero-length request is a "stat": the client only wanted total_size + CRC
+    // (e.g. to plan a multi-stream download). Send the header, no data, and skip
+    // the transfer bookkeeping so it never shows as a spurious transfer.
+    if len == 0 {
+        stream.flush()?;
+        return Ok(());
+    }
 
     // Coalesce into one transfer row keyed by path (whole-file total), exactly
     // like the HTTP download does for its many Range chunks.
@@ -274,6 +286,37 @@ fn reply_err(stream: &mut TcpStream, status: u8, msg: &str) -> io::Result<()> {
     stream.write_all(&out)?;
     let _ = stream.flush();
     Ok(())
+}
+
+/// Whole-file CRC-32, cached per `(path, size, mtime)`. A multi-stream download
+/// opens many connections to the same file; without a cache each handshake would
+/// re-read the whole file to compute the CRC (N full reads). The first caller for
+/// a given file computes it, the rest reuse the cached value. When the file
+/// changes (size or mtime), the key changes and it is recomputed. Returns `None`
+/// only if the read itself fails.
+fn cached_crc(path: &Path, meta: &Metadata) -> Option<u32> {
+    static CACHE: OnceLock<Mutex<HashMap<(PathBuf, u64, u128), Arc<OnceLock<u32>>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let key = (path.to_path_buf(), meta.len(), mtime);
+    let slot = {
+        let mut map = cache.lock().ok()?;
+        Arc::clone(map.entry(key).or_insert_with(|| Arc::new(OnceLock::new())))
+    };
+    if let Some(v) = slot.get() {
+        return Some(*v);
+    }
+    // Compute outside the map lock. A rare concurrent first-compute may read
+    // twice; the client's upfront stat means workers normally see a warm cache.
+    let crc = crc32_file(path).ok()?;
+    let _ = slot.set(crc);
+    Some(crc)
 }
 
 // ---- Little-endian framing helpers (server side) ----

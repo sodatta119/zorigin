@@ -78,6 +78,18 @@ Then the server writes the raw bytes of `[offset, offset + len)` where
 file. No per-byte framing inside the range - TCP is a reliable ordered stream, so
 the client reads exactly `len` bytes and writes them at `offset` in its file.
 
+**Stat (zero-length) request.** A handshake whose effective `len` is 0 - the
+client sends `offset >= total_size` (e.g. `offset = u64::MAX`) - is a "stat": the
+server replies with the OK header (`total_size` + CRC) and **no data**, and does
+not create a transfer row. The multi-stream client uses this once up front to
+learn the file size before fanning out, which also warms the server's CRC cache
+(below) so the parallel workers don't each recompute it.
+
+**Server CRC cache (implementation note, not wire-visible).** The server caches
+the whole-file CRC-32 per `(path, size, mtime)`. Without it, every one of a
+multi-stream download's handshakes would re-read the whole file to compute the
+CRC. The first request (normally the stat) computes it; the rest reuse it.
+
 On **error** (`status != 0`):
 
 ```
@@ -123,11 +135,30 @@ On **error** (`status != 0`):
   offset from the bytes already on disk. A fast-lane failure never fails a
   transfer that HTTP could complete.
 
-## 7. Multi-stream (later phase - noted, not in v1)
+## 7. Multi-stream (implemented) + adaptation (later phase)
 
-v1 uses a single connection / single range. The throughput win on lossy Wi-Fi
-comes from opening **N connections**, each requesting a distinct `[offset,
-range_len)` slice of the same file and writing it at the right position, plus
-adapting the connection count and range size to measured throughput/RTT. The
-framing above already carries everything needed for that (per-connection offset +
-range_len); only the client's scheduling changes.
+The client opens **N connections** (default 4), each requesting a distinct
+`[offset, range_len)` slice of the same file (default 4 MiB chunks) and writing it
+at the correct absolute offset via a positioned write, so the ranges reassemble
+with no locking on the hot path. Workers pull chunk indices from a shared queue;
+a failed chunk is requeued and retried by any worker, and if the pool exhausts its
+retry budget the client truncates the temp file to its **contiguous prefix** and
+falls back to HTTP from there. On success it verifies the whole-file size + CRC-32
+before the atomic rename. The wire format above is unchanged - only the client's
+scheduling differs from a single stream.
+
+**Resume model with holes.** During a run the temp file is pre-sized to
+`total_size` and filled at offsets, so it briefly contains gaps. The client
+guarantees the file at rest is either complete or a valid contiguous prefix: on a
+graceful failure/fallback it truncates to the contiguous prefix, so the next run
+(or the HTTP fallback) resumes by size as usual. A hard process kill mid-run can
+leave a full-size file with holes; the whole-file CRC check catches this and the
+download restarts clean (never surfaced as complete). A future per-file chunk
+manifest (sidecar) would make even a hard-kill resumable - noted, not built.
+
+**Adaptation (next phase, P3):** the connection count and chunk size are fixed
+defaults today (overridable via the CLI `--streams` / `--chunk-mb`). P3 will drive
+them from measured per-connection throughput and RTT, logging the chosen values.
+
+**True loss-tolerance (out of scope):** independent streams with no head-of-line
+blocking and real FEC is QUIC/UDP territory (`quinn`/`iroh`), a separate track.

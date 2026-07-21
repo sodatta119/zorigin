@@ -60,7 +60,12 @@ fn run() -> Result<()> {
 
         // LAN download over the native fast lane (HTTP fallback). Not a
         // host-driven Transport - it drives another Zap's web/fast-lane server.
-        Command::Get { url, dest } => cmd_get(&url, &dest),
+        Command::Get {
+            url,
+            dest,
+            streams,
+            chunk_mb,
+        } => cmd_get(&url, &dest, streams, chunk_mb),
 
         Command::Devices => {
             let transport = build_transport(cli.transport)?;
@@ -86,17 +91,32 @@ fn run() -> Result<()> {
 
 /// Download a file from a Zap share link, using the fast lane when the peer
 /// advertises one and falling back to HTTP otherwise.
-fn cmd_get(url: &str, dest: &str) -> Result<()> {
-    let report = web::fast_client::get(url, std::path::Path::new(dest))?;
-    let lane = if report.used_fast { "fast lane" } else { "HTTP" };
+fn cmd_get(url: &str, dest: &str, streams: usize, chunk_mb: u64) -> Result<()> {
+    let opts = web::fast_client::GetOptions {
+        streams: streams.max(1),
+        chunk_size: chunk_mb.max(1) << 20,
+    };
+    let started = std::time::Instant::now();
+    let report = web::fast_client::get_with(url, std::path::Path::new(dest), opts)?;
+    let elapsed = started.elapsed().as_secs_f64();
+    let lane = if report.used_fast {
+        format!("fast lane, {} streams", report.streams)
+    } else {
+        "HTTP".to_string()
+    };
     let verified = if report.verified { ", integrity verified" } else { "" };
     let resumed = if report.resumed_from > 0 {
         format!(" (resumed from {} bytes)", report.resumed_from)
     } else {
         String::new()
     };
+    let rate = if elapsed > 0.0 {
+        report.total as f64 / elapsed / (1024.0 * 1024.0)
+    } else {
+        0.0
+    };
     println!(
-        "downloaded {} - {} bytes via {lane}{verified}{resumed}",
+        "downloaded {} - {} bytes via {lane}{verified}{resumed} in {elapsed:.2}s ({rate:.1} MB/s)",
         report.path.display(),
         report.total
     );

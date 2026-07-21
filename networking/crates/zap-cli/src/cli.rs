@@ -63,6 +63,12 @@ pub enum Command {
         /// Destination file or directory (defaults to the current directory).
         #[arg(default_value = ".")]
         dest: String,
+        /// Number of parallel fast-lane connections (streams).
+        #[arg(long, default_value_t = 4)]
+        streams: usize,
+        /// Byte range each stream requests at a time, in MiB.
+        #[arg(long = "chunk-mb", default_value_t = 4)]
+        chunk_mb: u64,
     },
 
     /// Start a web server so a phone can transfer files over Wi-Fi (no app).

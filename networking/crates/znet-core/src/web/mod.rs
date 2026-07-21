@@ -2945,6 +2945,57 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A zero-length request (offset past EOF) is a stat: it returns total_size
+    /// + CRC, sends no file data, and must not create a transfer row. This is how
+    /// the multi-stream client learns the size and warms the server CRC cache.
+    #[test]
+    fn fast_stat_returns_total_without_data_or_transfer_row() {
+        use std::net::TcpStream;
+        let _g = port_guard();
+        let dir = std::env::temp_dir().join(format!("zap-faststat-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let data = payload(5_000);
+        fs::write(dir.join("f.bin"), &data).unwrap();
+
+        let (port, handle) = spawn_test_server(&dir);
+        let fp = advertised_fast_port(port, None).expect("fast port");
+
+        let mut s = TcpStream::connect(("127.0.0.1", fp)).expect("connect");
+        let mut hs = Vec::new();
+        hs.extend_from_slice(fast::MAGIC);
+        hs.extend_from_slice(&fast::VERSION.to_le_bytes());
+        hs.push(fast::OP_GET);
+        hs.extend_from_slice(&0u16.to_le_bytes()); // no token
+        let path = b"f.bin";
+        hs.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        hs.extend_from_slice(path);
+        hs.extend_from_slice(&u64::MAX.to_le_bytes()); // offset past EOF -> stat
+        hs.extend_from_slice(&0u64.to_le_bytes());
+        s.write_all(&hs).expect("write handshake");
+        s.flush().ok();
+
+        let mut status = [0u8; 1];
+        s.read_exact(&mut status).expect("status");
+        assert_eq!(status[0], fast::ST_OK);
+        let mut tb = [0u8; 8];
+        s.read_exact(&mut tb).expect("total");
+        assert_eq!(u64::from_le_bytes(tb), data.len() as u64, "stat reports total size");
+        let mut hc = [0u8; 1];
+        s.read_exact(&mut hc).expect("has_crc");
+        if hc[0] == 1 {
+            let mut cb = [0u8; 4];
+            s.read_exact(&mut cb).expect("crc");
+        }
+        let mut rest = Vec::new();
+        s.read_to_end(&mut rest).expect("read body");
+        assert!(rest.is_empty(), "stat must send no file data, got {} bytes", rest.len());
+        assert!(handle.transfers().is_empty(), "stat must not create a transfer row");
+
+        handle.stop();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     // ---- TLS: self-signed HTTPS + fingerprint pinning (feature `tls`) ----
 
     /// End-to-end encryption: a server with a generated self-signed cert speaks

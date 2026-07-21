@@ -16,6 +16,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -23,9 +25,6 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use super::{crc32_file, fast};
 
-/// How many times to (re)try the fast lane, re-handshaking from the current
-/// on-disk offset each time, before giving up and falling back to HTTP.
-const FAST_ATTEMPTS: u32 = 4;
 /// Streaming buffer size.
 const CHUNK: usize = 128 * 1024;
 
@@ -43,9 +42,13 @@ pub struct Report {
     /// Bytes already on disk when the download started (0 for a fresh download,
     /// non-zero when it resumed a partial `.zap-part-` file).
     pub resumed_from: u64,
+    /// Number of parallel connections the fast lane actually used (0 for the
+    /// HTTP fallback).
+    pub streams: usize,
 }
 
 /// A Zap download link, broken into its parts.
+#[derive(Clone)]
 struct Target {
     host: String,
     port: u16,
@@ -61,9 +64,35 @@ struct Target {
     filename: String,
 }
 
+/// Tunables for the fast lane. `streams` is the number of parallel TCP
+/// connections; `chunk_size` is the byte range each connection requests at a
+/// time. P3 will adapt these live from measured throughput/RTT; for now they are
+/// fixed defaults (overridable from the CLI for experiments).
+#[derive(Debug, Clone, Copy)]
+pub struct GetOptions {
+    pub streams: usize,
+    pub chunk_size: u64,
+}
+
+/// ~4 parallel connections is a sensible starting point (per the design brief);
+/// modest chunks keep a dropped stream cheap to re-fetch.
+impl Default for GetOptions {
+    fn default() -> Self {
+        GetOptions {
+            streams: 4,
+            chunk_size: 4 << 20, // 4 MiB
+        }
+    }
+}
+
 /// Download the file named by a Zap link into `dest` (a file path or a
 /// directory), using the fast lane when available and falling back to HTTP.
 pub fn get(url: &str, dest: &Path) -> Result<Report> {
+    get_with(url, dest, GetOptions::default())
+}
+
+/// Like [`get`], with explicit fast-lane tunables.
+pub fn get_with(url: &str, dest: &Path, opts: GetOptions) -> Result<Report> {
     let target = parse_target(url)?;
     let (folder, final_path) = resolve_dest(dest, &target.filename);
     fs::create_dir_all(&folder)
@@ -81,8 +110,8 @@ pub fn get(url: &str, dest: &Path) -> Result<Report> {
     let fast_port = probe_fast_port(&target).unwrap_or(None);
 
     if let Some(fp) = fast_port {
-        match fast_download(&target, fp, &part) {
-            Ok((total, verified, resumed)) => {
+        match fast_download(&target, fp, &part, opts) {
+            Ok((total, verified, resumed, streams)) => {
                 finalize(&part, &final_path)?;
                 return Ok(Report {
                     path: final_path,
@@ -90,6 +119,7 @@ pub fn get(url: &str, dest: &Path) -> Result<Report> {
                     used_fast: true,
                     verified,
                     resumed_from: resumed,
+                    streams,
                 });
             }
             Err(e) => {
@@ -98,7 +128,8 @@ pub fn get(url: &str, dest: &Path) -> Result<Report> {
         }
     }
 
-    // HTTP fallback - resumes from whatever the fast lane already wrote.
+    // HTTP fallback - resumes from whatever the fast lane already wrote (a
+    // multi-stream attempt leaves a valid contiguous prefix on failure).
     let (total, resumed) = http_download(&target, &part)?;
     finalize(&part, &final_path)?;
     Ok(Report {
@@ -107,6 +138,7 @@ pub fn get(url: &str, dest: &Path) -> Result<Report> {
         used_fast: false,
         verified: false,
         resumed_from: resumed,
+        streams: 0,
     })
 }
 
@@ -118,68 +150,241 @@ fn finalize(part: &Path, final_path: &Path) -> Result<()> {
         .with_context(|| format!("finalizing {}", final_path.display()))
 }
 
-// ---- Fast lane ----
+// ---- Fast lane (multi-stream) ----
 
-/// Drive a fast-lane download, retrying (re-handshaking from the current on-disk
-/// offset) on transient failure. Verifies whole-file size and CRC-32 before
-/// returning; on a CRC mismatch it discards the temp file and retries clean.
-fn fast_download(t: &Target, fast_port: u16, part: &Path) -> Result<(u64, bool, u64)> {
-    let resumed_from = fs::metadata(part).map(|m| m.len()).unwrap_or(0);
-    let mut last_err = None;
+/// Max times a single chunk may fail (across the whole pool) before the fast
+/// lane gives up and the caller falls back to HTTP.
+const MAX_CHUNK_ATTEMPTS: u32 = 4;
 
-    for attempt in 1..=FAST_ATTEMPTS {
-        let on_disk = fs::metadata(part).map(|m| m.len()).unwrap_or(0);
-        match fast_download_once(t, fast_port, part, on_disk) {
-            Ok((total, crc_opt)) => {
-                let got = fs::metadata(part).map(|m| m.len()).unwrap_or(0);
-                if got != total {
-                    // Short read (connection dropped): resume on the next attempt.
-                    last_err = Some(anyhow!("incomplete: {got}/{total} bytes"));
-                    if attempt < FAST_ATTEMPTS {
-                        thread::sleep(Duration::from_millis(200));
-                        continue;
-                    }
-                    break;
-                }
-                let verified = match crc_opt {
-                    Some(want) => {
-                        let got_crc = crc32_file(part).map_err(|e| anyhow!("reading for CRC: {e}"))?;
-                        if got_crc != want {
-                            // Corrupt: discard so the retry starts from a clean slate.
-                            let _ = fs::remove_file(part);
-                            last_err = Some(anyhow!("integrity check failed (CRC mismatch)"));
-                            if attempt < FAST_ATTEMPTS {
-                                continue;
-                            }
-                            break;
-                        }
-                        true
-                    }
-                    None => false,
-                };
-                return Ok((total, verified, resumed_from));
-            }
-            Err(e) => {
-                last_err = Some(e);
-                if attempt < FAST_ATTEMPTS {
-                    thread::sleep(Duration::from_millis(200));
-                    continue;
-                }
-            }
-        }
-    }
-    Err(last_err.unwrap_or_else(|| anyhow!("fast lane failed")))
+/// One unit of parallel work: a byte range `[offset, offset+len)` of the file.
+#[derive(Clone, Copy)]
+struct Chunk {
+    offset: u64,
+    len: u64,
 }
 
-/// One fast-lane handshake + range download starting at `offset`, writing into
-/// `part`. Returns the whole-file size and optional CRC from the server reply.
-fn fast_download_once(t: &Target, fast_port: u16, part: &Path, offset: u64) -> Result<(u64, Option<u32>)> {
-    let mut stream = TcpStream::connect((t.host.as_str(), fast_port))
+/// Drive a multi-stream fast-lane download.
+///
+/// It stats the file once (learning `total` + whole-file CRC and warming the
+/// server's CRC cache), pre-sizes the temp file, then splits the remaining bytes
+/// into fixed-size chunks that `streams` worker threads pull from a shared queue,
+/// each writing its range at the correct offset (positioned writes, no locking on
+/// the hot path). On success it verifies the whole-file size + CRC and returns.
+///
+/// Resilience: a chunk that fails is requeued and retried by any worker; if the
+/// pool exhausts its retry budget the file is truncated to its **contiguous
+/// prefix** (so the on-disk temp file is always a valid resume point) and an
+/// error is returned, letting the caller finish over HTTP. Returns
+/// `(total, verified, resumed_from, streams_used)`.
+fn fast_download(
+    t: &Target,
+    fast_port: u16,
+    part: &Path,
+    opts: GetOptions,
+) -> Result<(u64, bool, u64, usize)> {
+    let (total, crc) = fast_stat(t, fast_port)?;
+
+    // The on-disk temp file is always a contiguous prefix (we truncate to one on
+    // any failure), so its length is a valid resume offset.
+    let mut start = fs::metadata(part).map(|m| m.len()).unwrap_or(0);
+    if start > total {
+        start = 0; // stale/oversized partial: start clean
+    }
+
+    // Pre-size to the full length so workers can write their ranges at absolute
+    // offsets; the existing [0, start) prefix is preserved, the rest zero-filled.
+    {
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(part)
+            .with_context(|| format!("opening {}", part.display()))?;
+        file.set_len(total)?;
+    }
+
+    if start == total {
+        // Everything is already here (e.g. resuming a finished-but-unrenamed
+        // download): just verify.
+        let verified = verify_crc(part, crc)?;
+        if crc.is_some() && !verified {
+            let _ = fs::remove_file(part);
+            bail!("integrity check failed (CRC mismatch)");
+        }
+        return Ok((total, verified, start, 0));
+    }
+
+    let chunk_size = opts.chunk_size.max(64 * 1024);
+    let chunks = plan_chunks(start, total, chunk_size);
+    let streams = opts.streams.max(1).min(chunks.len());
+
+    let done: Arc<Vec<AtomicBool>> = Arc::new((0..chunks.len()).map(|_| AtomicBool::new(false)).collect());
+    // Pending chunk indices (as a stack); failed chunks are pushed back on.
+    let pending = Arc::new(Mutex::new((0..chunks.len()).rev().collect::<Vec<usize>>()));
+    let attempts = Arc::new(Mutex::new(vec![0u32; chunks.len()]));
+    let abort = Arc::new(AtomicBool::new(false));
+    let chunks = Arc::new(chunks);
+
+    let mut handles = Vec::with_capacity(streams);
+    for _ in 0..streams {
+        let t = t.clone();
+        let part = part.to_path_buf();
+        let done = Arc::clone(&done);
+        let pending = Arc::clone(&pending);
+        let attempts = Arc::clone(&attempts);
+        let abort = Arc::clone(&abort);
+        let chunks = Arc::clone(&chunks);
+        handles.push(thread::spawn(move || {
+            // One write handle per worker, reused for all its chunks.
+            let file = match OpenOptions::new().write(true).open(&part) {
+                Ok(f) => f,
+                Err(_) => {
+                    abort.store(true, Ordering::SeqCst);
+                    return;
+                }
+            };
+            loop {
+                if abort.load(Ordering::SeqCst) {
+                    return;
+                }
+                let idx = match pending.lock().unwrap_or_else(|e| e.into_inner()).pop() {
+                    Some(i) => i,
+                    None => return, // queue drained
+                };
+                let c = chunks[idx];
+                match download_chunk(&t, fast_port, &file, c) {
+                    Ok(()) => {
+                        done[idx].store(true, Ordering::SeqCst);
+                    }
+                    Err(_) => {
+                        let over = {
+                            let mut a = attempts.lock().unwrap_or_else(|e| e.into_inner());
+                            a[idx] += 1;
+                            a[idx] >= MAX_CHUNK_ATTEMPTS
+                        };
+                        if over {
+                            abort.store(true, Ordering::SeqCst);
+                            return;
+                        }
+                        // Requeue and let any worker retry after a brief backoff.
+                        pending.lock().unwrap_or_else(|e| e.into_inner()).push(idx);
+                        thread::sleep(Duration::from_millis(150));
+                    }
+                }
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+
+    let all_done = done.iter().all(|d| d.load(Ordering::SeqCst));
+    if !all_done {
+        // Leave the temp file as a valid contiguous prefix so HTTP fallback (and
+        // the next run) resumes cleanly instead of seeing a holey full-size file.
+        let prefix = contiguous_prefix(start, &chunks, &done);
+        if let Ok(file) = OpenOptions::new().write(true).open(part) {
+            let _ = file.set_len(prefix);
+        }
+        bail!("fast lane incomplete after retries (contiguous prefix {prefix}/{total})");
+    }
+
+    let got = fs::metadata(part).map(|m| m.len()).unwrap_or(0);
+    if got != total {
+        bail!("fast lane size mismatch: {got}/{total}");
+    }
+    let verified = verify_crc(part, crc)?;
+    if crc.is_some() && !verified {
+        // Corrupt assembly: discard so the next attempt starts clean.
+        let _ = fs::remove_file(part);
+        bail!("integrity check failed (CRC mismatch)");
+    }
+    Ok((total, verified, start, streams))
+}
+
+/// Split `[start, total)` into `chunk_size` pieces (the last may be shorter).
+fn plan_chunks(start: u64, total: u64, chunk_size: u64) -> Vec<Chunk> {
+    let mut chunks = Vec::new();
+    let mut off = start;
+    while off < total {
+        let len = chunk_size.min(total - off);
+        chunks.push(Chunk { offset: off, len });
+        off += len;
+    }
+    chunks
+}
+
+/// The length of the contiguous run of completed chunks from `start` - the point
+/// up to which the temp file is a valid, gap-free prefix.
+fn contiguous_prefix(start: u64, chunks: &[Chunk], done: &[AtomicBool]) -> u64 {
+    let mut prefix = start;
+    for (i, c) in chunks.iter().enumerate() {
+        if done[i].load(Ordering::SeqCst) {
+            prefix = c.offset + c.len;
+        } else {
+            break;
+        }
+    }
+    prefix
+}
+
+/// Verify the temp file's whole-file CRC-32 against `expected`. `Ok(true)` when
+/// it matches (or there is nothing to check but the caller treats "no CRC" as
+/// unverified via the `crc.is_some()` guard).
+fn verify_crc(part: &Path, expected: Option<u32>) -> Result<bool> {
+    match expected {
+        Some(want) => {
+            let got = crc32_file(part).map_err(|e| anyhow!("reading for CRC: {e}"))?;
+            Ok(got == want)
+        }
+        None => Ok(false),
+    }
+}
+
+/// Stat the file over the fast lane: a handshake with a zero-length range
+/// (offset past EOF) returns `total_size` + optional whole-file CRC and no data.
+/// This also warms the server's CRC cache before the parallel workers connect.
+fn fast_stat(t: &Target, fast_port: u16) -> Result<(u64, Option<u32>)> {
+    let mut stream = connect_fast(t, fast_port)?;
+    write_handshake(&mut stream, t, u64::MAX, 0)?;
+    let (total, crc) = read_reply(&mut stream)?;
+    Ok((total, crc))
+}
+
+/// Download one chunk over its own connection, writing the bytes at their
+/// absolute offset in `file`. Errors on a short read (dropped connection) so the
+/// caller can requeue the chunk.
+fn download_chunk(t: &Target, fast_port: u16, file: &std::fs::File, c: Chunk) -> Result<()> {
+    let mut stream = connect_fast(t, fast_port)?;
+    write_handshake(&mut stream, t, c.offset, c.len)?;
+    let _ = read_reply(&mut stream)?; // total/CRC already known from the stat
+
+    let mut pos = c.offset;
+    let mut remaining = c.len;
+    let mut buf = [0u8; CHUNK];
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        let n = stream.read(&mut buf[..want])?;
+        if n == 0 {
+            bail!("connection closed with {remaining} bytes left in chunk");
+        }
+        write_at(file, pos, &buf[..n])?;
+        pos += n as u64;
+        remaining -= n as u64;
+    }
+    Ok(())
+}
+
+/// Open a fast-lane connection with sensible socket options.
+fn connect_fast(t: &Target, fast_port: u16) -> Result<TcpStream> {
+    let stream = TcpStream::connect((t.host.as_str(), fast_port))
         .with_context(|| format!("connecting to fast lane {}:{fast_port}", t.host))?;
     stream.set_nodelay(true).ok();
     stream.set_read_timeout(Some(Duration::from_secs(60))).ok();
+    Ok(stream)
+}
 
-    // ---- Handshake ----
+/// Write a GET handshake for `[offset, offset+range_len)` (range_len 0 = to EOF).
+fn write_handshake(stream: &mut TcpStream, t: &Target, offset: u64, range_len: u64) -> Result<()> {
     let token = t.token.clone().unwrap_or_default();
     let path_bytes = t.file_path.as_bytes();
     let mut hs = Vec::with_capacity(27 + token.len() + path_bytes.len());
@@ -191,11 +396,15 @@ fn fast_download_once(t: &Target, fast_port: u16, part: &Path, offset: u64) -> R
     hs.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
     hs.extend_from_slice(path_bytes);
     hs.extend_from_slice(&offset.to_le_bytes());
-    hs.extend_from_slice(&0u64.to_le_bytes()); // range_len 0 = to EOF
+    hs.extend_from_slice(&range_len.to_le_bytes());
     stream.write_all(&hs)?;
     stream.flush()?;
+    Ok(())
+}
 
-    // ---- Reply ----
+/// Read a handshake reply: `Ok((total_size, optional_crc))`, or an error carrying
+/// the server's message.
+fn read_reply(stream: &mut TcpStream) -> Result<(u64, Option<u32>)> {
     let mut status = [0u8; 1];
     stream.read_exact(&mut status)?;
     if status[0] != fast::ST_OK {
@@ -206,48 +415,42 @@ fn fast_download_once(t: &Target, fast_port: u16, part: &Path, offset: u64) -> R
         stream.read_exact(&mut msg).ok();
         bail!("server said: {}", String::from_utf8_lossy(&msg));
     }
-    let total = {
-        let mut b = [0u8; 8];
-        stream.read_exact(&mut b)?;
-        u64::from_le_bytes(b)
-    };
-    let has_crc = {
-        let mut b = [0u8; 1];
-        stream.read_exact(&mut b)?;
-        b[0] == 1
-    };
-    let crc = if has_crc {
-        let mut b = [0u8; 4];
-        stream.read_exact(&mut b)?;
-        Some(u32::from_le_bytes(b))
+    let mut b8 = [0u8; 8];
+    stream.read_exact(&mut b8)?;
+    let total = u64::from_le_bytes(b8);
+    let mut b1 = [0u8; 1];
+    stream.read_exact(&mut b1)?;
+    let crc = if b1[0] == 1 {
+        let mut b4 = [0u8; 4];
+        stream.read_exact(&mut b4)?;
+        Some(u32::from_le_bytes(b4))
     } else {
         None
     };
-
-    // ---- Body: write [offset, total) at the right position ----
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(part)
-        .with_context(|| format!("opening {}", part.display()))?;
-    file.seek(SeekFrom::Start(offset))?;
-    // Drop anything past our resume point so a re-handshake never leaves stale
-    // trailing bytes from a prior attempt.
-    file.set_len(offset)?;
-
-    let mut remaining = total.saturating_sub(offset);
-    let mut buf = [0u8; CHUNK];
-    while remaining > 0 {
-        let want = remaining.min(buf.len() as u64) as usize;
-        let n = stream.read(&mut buf[..want])?;
-        if n == 0 {
-            break; // connection dropped; caller verifies size and resumes/falls back
-        }
-        file.write_all(&buf[..n])?;
-        remaining -= n as u64;
-    }
-    file.flush()?;
     Ok((total, crc))
+}
+
+/// Write `buf` at absolute `offset` in `file`. On unix this is a lock-free
+/// positioned write (`pwrite`), so parallel workers never contend on a cursor.
+#[cfg(unix)]
+fn write_at(file: &std::fs::File, offset: u64, buf: &[u8]) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.write_all_at(buf, offset)?;
+    Ok(())
+}
+
+/// Portable fallback for non-unix targets: serialize positioned writes through a
+/// global lock (Zap's real targets are all unix, so this path is a compile-time
+/// safety net, not the hot path).
+#[cfg(not(unix))]
+fn write_at(file: &std::fs::File, offset: u64, buf: &[u8]) -> Result<()> {
+    use std::sync::Mutex as StdMutex;
+    static WRITE_LOCK: StdMutex<()> = StdMutex::new(());
+    let _g = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut f = file.try_clone()?;
+    f.seek(SeekFrom::Start(offset))?;
+    f.write_all(buf)?;
+    Ok(())
 }
 
 // ---- HTTP fallback ----
@@ -599,6 +802,123 @@ mod tests {
         assert_eq!(total2, data.len() as u64);
         assert_eq!(resumed2, 80_000, "should resume from the on-disk offset");
         assert_eq!(fs::read(&part).unwrap(), data, "HTTP resume byte-exact");
+
+        handle.stop();
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dst);
+    }
+
+    #[test]
+    fn plan_chunks_covers_the_whole_range() {
+        let chunks = plan_chunks(100, 1000, 300);
+        // [100,400) [400,700) [700,1000)
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].offset, 100);
+        assert_eq!(chunks[0].len, 300);
+        assert_eq!(chunks[2].offset, 700);
+        assert_eq!(chunks[2].len, 300);
+        // No gaps or overlaps, and the union is exactly [100,1000).
+        let covered: u64 = chunks.iter().map(|c| c.len).sum();
+        assert_eq!(covered, 900);
+
+        // A ragged tail chunk is shorter, not dropped.
+        let ragged = plan_chunks(0, 1000, 400);
+        assert_eq!(ragged.len(), 3);
+        assert_eq!(ragged[2].offset, 800);
+        assert_eq!(ragged[2].len, 200);
+    }
+
+    #[test]
+    fn contiguous_prefix_stops_at_first_gap() {
+        let chunks = plan_chunks(0, 1000, 250); // 4 chunks of 250
+        let done: Vec<AtomicBool> = (0..chunks.len()).map(|_| AtomicBool::new(false)).collect();
+        // chunk 0 and 1 done, chunk 2 missing, chunk 3 done -> prefix stops at 500.
+        done[0].store(true, Ordering::SeqCst);
+        done[1].store(true, Ordering::SeqCst);
+        done[3].store(true, Ordering::SeqCst);
+        assert_eq!(contiguous_prefix(0, &chunks, &done), 500);
+        // Fill the gap -> the whole file is a contiguous prefix.
+        done[2].store(true, Ordering::SeqCst);
+        assert_eq!(contiguous_prefix(0, &chunks, &done), 1000);
+    }
+
+    /// Spin up a server sharing `src`, returning (port, handle).
+    fn serve(src: &Path) -> (u16, crate::web::ServerHandle) {
+        let port = free_port();
+        let (_info, handle) = spawn(ServeConfig {
+            dir: src.to_path_buf(),
+            port,
+            bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            auth: None,
+            history: None,
+            index_html: None,
+            tls: None,
+        })
+        .expect("bind");
+        (port, handle)
+    }
+
+    /// Multi-stream download (many small chunks over several connections) must
+    /// reassemble byte-exact and verify the whole-file CRC.
+    #[test]
+    fn multi_stream_download_byte_exact() {
+        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let src = std::env::temp_dir().join(format!("zap-ms-src-{}", std::process::id()));
+        let dst = std::env::temp_dir().join(format!("zap-ms-dst-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dst);
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        let data: Vec<u8> = (0..1_000_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8 ^ (i as u8))
+            .collect();
+        fs::write(src.join("big.bin"), &data).unwrap();
+
+        let (port, handle) = serve(&src);
+        let url = format!("http://127.0.0.1:{port}/download?path=big.bin");
+        // 6 streams, 64 KiB chunks -> ~16 chunks spread across connections.
+        let opts = GetOptions { streams: 6, chunk_size: 64 * 1024 };
+        let report = get_with(&url, &dst, opts).expect("multi-stream get");
+
+        assert!(report.used_fast, "should use the fast lane");
+        assert!(report.verified, "whole-file CRC should verify");
+        assert_eq!(report.total, data.len() as u64);
+        assert_eq!(report.streams, 6);
+        assert_eq!(fs::read(dst.join("big.bin")).unwrap(), data, "reassembled byte-exact");
+        assert!(!dst.join(".zap-part-big.bin").exists(), "temp file removed");
+
+        handle.stop();
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dst);
+    }
+
+    /// Multi-stream resume: a contiguous partial prefix on disk is kept and only
+    /// the remaining chunks are fetched, still byte-exact.
+    #[test]
+    fn multi_stream_resumes_from_partial() {
+        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let src = std::env::temp_dir().join(format!("zap-msr-src-{}", std::process::id()));
+        let dst = std::env::temp_dir().join(format!("zap-msr-dst-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dst);
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        let data: Vec<u8> = (0..600_000u32)
+            .map(|i| (i.wrapping_mul(40_503) >> 7) as u8 ^ (i as u8))
+            .collect();
+        fs::write(src.join("big.bin"), &data).unwrap();
+
+        let seeded = 150_000usize;
+        fs::write(dst.join(".zap-part-big.bin"), &data[..seeded]).unwrap();
+
+        let (port, handle) = serve(&src);
+        let url = format!("http://127.0.0.1:{port}/download?path=big.bin");
+        let opts = GetOptions { streams: 4, chunk_size: 64 * 1024 };
+        let report = get_with(&url, &dst, opts).expect("multi-stream resume");
+
+        assert!(report.used_fast);
+        assert_eq!(report.resumed_from, seeded as u64, "kept the on-disk prefix");
+        assert_eq!(fs::read(dst.join("big.bin")).unwrap(), data, "resumed byte-exact");
 
         handle.stop();
         let _ = fs::remove_dir_all(&src);
